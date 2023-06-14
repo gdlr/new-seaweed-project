@@ -1,0 +1,82 @@
+---
+title: "florida_pluming"
+author: "Gabriel De La Rosa"
+date: "7/23/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+
+library(terra)
+library(sf)
+library(tidyverse)
+library(stars)
+library(here)
+library(raster)
+library(tmap)
+```
+
+## Let's read in the SABGOM grid...
+
+```{r}
+
+# this is the grid i want to project to
+
+# This is the outfall N I want
+outfall_N <- read_stars(here("plume_outputs", "outfalls", "full_N.tif"))
+
+
+plot(outfall_N)
+
+outfall_N_cb <- outfall_N %>% 
+  as.tbl_cube.stars()
+
+# out_terra <- rast(outfall_N)
+
+
+plot(outfall_N)
+
+
+outfall_N <- raster(here("plume_outputs", "outfalls", "full_N.tif"))
+
+grid <- rast(here("new_data", "sabgom_output_2005_u.nc4"))
+
+grid_stars <- read_ncdf(here("new_data", "sabgom_output_2005_u.nc4"))
+
+plot(outfall_N)
+plot(grid_stars)
+# plot(grid)
+
+
+plot(outfall_N)
+
+plot(outfall_N)
+view(outfall_N)
+# This creates raw outfall N, in kg/cell/year
+# But If I go back and divide by area/cell, then I get kg/area/yr
+area <- st_area(outfall_N)
+out_concN <- outfall_N/area
+# Then, I can warp the grid, because it's a concentration
+warp_N  <- st_crop(out_concN, grid, use_gdal = TRUE)
+# Then, I can multiply again by the new cell area
+new_area <- st_area(warp_N)
+outfallN_SABGOM <- new_area*warp_N
+write_stars(obj = outfallN_SABGOM, "outfallN_SABGOM.nc")
+
+outfall_P <- read_stars(here("plume_outputs", "outfalls", "full_P.tif"))
+# area <- st_area(outfall_P)
+out_concP <- outfall_P/area
+# Then, I can warp the grid, because it's a concentration
+warp_P  <- st_crop(out_concP, grid, use_gdal = TRUE)
+# Then, I can multiply again by the new cell area
+new_area <- st_area(warp_P)
+outfallP_SABGOM <- new_area*warp_P
+
+
+write_stars(obj = outfallP_SABGOM, "outfallP_SABGOM.nc")
+
+
+unique(outfall_N$full_N.tif)
+```

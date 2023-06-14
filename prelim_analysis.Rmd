@@ -1,0 +1,314 @@
+---
+title: "prelim_analysis"
+author: "Gabriel De La Rosa"
+date: "7/13/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(raster)
+library(sf)
+library(terra)
+library(gstat)
+library(tmap)
+library(here)
+```
+
+# Process natural nutrient inputs:
+```{r}
+# river nutrients
+# In kg/yr
+  anthro_riverN <- rast(here("plume_outputs", "nitrogen", "anthro_riverN.tif"))
+  anthro_riverP <- rast(here("plume_outputs", "phosphorous", "anthro_riverP.tif"))
+
+# outfall nutrients
+  # in kg/yr
+  # outfall_N <- rast(here("plume_outputs", "outfalls", "outfall_n.tif"))
+  out_full_N <- rast(here("plume_outputs", "outfalls", "full_n.tif"))
+  out_full_P <- rast(here("plume_outputs", "outfalls", "full_p.tif"))
+
+# Deposition
+  # in mgN/m2/yr
+  deposition <- rast(here("new_data", "from_nut_hotspots", "nit_dep_1993.tif"))
+  # Resample to .008x.008 degrees
+  dep_res <- terra::resample(deposition, anthro_riverN, method = "near")
+  # Compute cell size in m
+  a_008 <- terra::cellSize(anthro_riverN, unit = "m")
+  #plot(a_008)
+  
+  # Convert units:
+  dep_kg <- dep_res * a_008 * (1/1000000)
+  
+ # hist(dep_kg)
+  
+# plot(dep_kg)
+  
+# All together in kg/year, summing outfalls  and rivers
+  
+  anthro_N <- dep_kg + anthro_riverN + out_full_N
+  anthro_P <- anthro_riverP + out_full_P
+  
+  # plot(anthro_N)
+  # plot(anthro_P)
+```
+
+
+```{r}
+# Load in BO nitrogen:
+bo_nit <- raster(here("new_data", "from_nut_hotspots", "bo_nit_2dg.tif"))
+bo_phos <- raster(here("new_data", "from_nut_hotspots", "bo_phos_2dg.tif"))
+
+# Interpolate to the coasts:
+inter <- function(file){
+    r <- file             # Load in the raster
+    # grid <- raster::projectExtent(r, res = 0.2)
+    xy <- data.frame(xyFromCell(r, 1:ncell(r))) #create a df of the grid
+    v = getValues(r) # and a list of the values..
+    tmpdf <- cbind(xy, v)%>%filter(!is.na(v)) # Bind them together
+    mg <- gstat(id = "v", formula = v~1, locations = ~x+y, data=tmpdf,
+              nmax=7, set=list(idp = 2)) # Create a model (power function = 2)
+    z <- interpolate(r, mg, progress='text')
+}
+
+bo_interN <- inter(bo_nit) %>% 
+  rast()
+bo_interP <- inter(bo_phos) %>% 
+  rast()
+
+# Convert the concentration to kg/cell:
+# Original is in micromols/L
+
+##       1 umol/l * 62.0049 g/mol N * 1 mol/1e9 umol = gN/l * 1000 L/1m3 * 1kg/1000g
+
+n_conv <- 62.0049 * 1/1e9 * 1/1000 * 1000/1
+p_conv <- 94.9714 * 1/1e9 * 1/1000 * 1000/1
+
+# Convert the whole raster to kg/m3
+bo_N_kgm <- bo_interN * n_conv
+bo_P_kgm <- bo_interP * p_conv
+
+# Then multiply by the cell size to get just kg per cell:
+bo_Nkg <- bo_N_kgm * cellSize(bo_N_kgm)
+bo_Pkg <- bo_P_kgm * cellSize(bo_P_kgm)
+```
+
+```{r}
+# Create a natural nitrogen river plume layer:
+# Load in the total river nitrogen:
+riverN <- rast(here("plume_outputs", "us_tn_river.tif"))
+riverP <- rast(here("plume_outputs", "us_tp_river.tif"))
+
+nat_riverN <- riverN - anthro_riverN
+nat_riverP <- riverP - anthro_riverP
+
+# Reclassify so NA's don't give 
+# Calculate expansion size
+expansion <- .2/.008
+# Create template 0.2 degree raster so we can keep coastal values
+template <- rast(crs = crs(bo_nit), res = res(bo_nit), extent = ext(bo_nit), vals = 0)
+
+nat_riverN_downscale <- terra::aggregate(nat_riverN, fact = expansion, fun = "mean", na.rm = TRUE)
+nat_riverP_downscale <- terra::aggregate(nat_riverP, fact = expansion, fun = "mean", na.rm = TRUE)
+# Then aligning the cells
+nat_riverN_res <- terra::resample(nat_riverN_downscale, template, method = "near")
+nat_riverP_res <- terra::resample(nat_riverP_downscale, template, method = "near")
+
+# Now we can add the kg introduced by rivers to the BO plume layer in kg:
+naturalN <- bo_Nkg + nat_riverN_res
+naturalP <- bo_Pkg + nat_riverP_res
+
+plot(riverP)
+
+plot(anthro_riverP)
+
+```
+
+# Process anthropogenic inputs:
+```{r}
+# Aggregate the anthro n layer to 0.2 degree cells, summing values
+anthro_n_downscale <- terra::aggregate(anthro_N, fact = expansion, fun = "sum", na.rm = TRUE)
+anthro_p_downscale <- terra::aggregate(anthro_P, fact = expansion, fun = "sum", na.rm = TRUE)
+
+# Resample it to the BO layer so the cells align completely
+anthro_n_res <- terra::resample(anthro_n_downscale, template, method = "near")
+anthro_p_res <- terra::resample(anthro_p_downscale, template, method = "near")
+# plot(anthro_n_res)
+
+
+# This is in kg/kg ### MY natural river nutrient layer is all messed up
+ratio <- anthro_n_res/naturalN
+ratioP <- anthro_p_res/naturalP
+
+# So do it without:
+rato_noriverN <- anthro_n_res/bo_Nkg
+ratio_noriverP <- anthro_p_res/bo_Pkg
+
+plot(ratio)
+plot(ratioP)
+
+terra::writeRaster(ratio, here("analysis_outputs", "anthro_N_ratio.tif"), overwrite = TRUE)
+terra::writeRaster(ratioP, here("analysis_outputs", "anthro_P_ratio.tif"), overwrite = TRUE)
+```
+
+# Map it:
+
+### When we look at a bigger map...
+
+## Nitrogen ratio
+
+This is in kg/cell anthropogenic nitrogen / kg/cell natural nitrogen
+
+```{r}
+## US shapefile (for plotting)
+us_shp <- st_read(here("new_data", "us_shapefile", "US_mainland.shp"))
+
+tmap_mode("view")
+tm_shape(ratio_noriverP) +
+  tm_raster(style = "jenks", n = 12, title = "Anthropogenic nitrogen to natural nitrogen ratio",
+            palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+            legend.hist = TRUE)
+```
+
+
+## Phosphorus ratio
+```{r}
+tm_shape(ratio_noriverP) +
+  tm_raster(style = "jenks", n = 12, title = "Anthro phosphorus to natural phosphorus ratio",
+            palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+            legend.hist = TRUE) +
+  tm_shape(us_shp) +
+  tm_polygons(col = "white")
+```
+
+# Add in exclusion:
+```{r}
+# Turn the exclusion layer into a 2 degree grid
+exclusion <- rast(here("new_data", "exclusion", "us_exclusion.tif"))
+
+# plot(exclusion)
+# by downscaling to the proper res
+exclusion_downscale <- terra::aggregate(exclusion, fact = expansion, fun = "mean", na.rm = TRUE)
+# Then aligning the cells
+exclusion_res <- terra::resample(exclusion_downscale, template, method = "near") 
+
+m <- c(-Inf, 0, 0,
+       0.0000001, Inf, 1)
+
+rclmat <- matrix(m, ncol=3, byrow=TRUE)
+
+exclusion_reclass <- exclusion_res %>% 
+  terra::classify(rclmat)
+
+plot(exclusion_reclass)
+```
+
+
+
+```{r}
+# Calculate some cell statistics based on the exclusion layer
+# By first summing all the nitrogen/phosphorus in the water
+totalN <- raster(anthro_n_res)
+sumN <- raster::cellStats(totalN, "sum")
+
+totalP <- raster(anthro_p_res)
+sumP <- raster::cellStats(totalP, "sum")
+
+# Then calculating how much of that pollutant lies within suitable aquaculture area
+availableN <- totalN * raster(exclusion_reclass)
+availableP <- totalP * raster(exclusion_reclass)
+
+# First sum the total available N
+sum_avN <- raster::cellStats(availableN, "sum")
+sum_avP <- raster::cellStats(availableP, "sum")
+# Then calculate the percentage available
+pct_av_N <- sum_avN/sumN * 100
+pct_av_P <- sum_avP/sumN * 100
+```
+
+According to a quick calculation, only `r round(pct_av_N, 2)`% of anthropogenic nitrogen inputs fall within available marine space, and only `r round(pct_av_P, 2)`% phosphorus exists in available marine space.
+
+```{r}
+# Let's plot this:
+tm_shape(availableN) +
+  tm_raster(style = "jenks", n = 12, title = "Nitrogen within available space (kg/yr)",
+            palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+            legend.hist = TRUE) +
+  tm_shape(us_shp) +
+  tm_polygons(col = "white")
+
+
+tm_shape(availableP) +
+    tm_raster(style = "jenks", n = 12, title = "Phosphorus within available space (kg/yr)",
+            palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+            legend.hist = TRUE) +
+  tm_shape(us_shp) +
+  tm_polygons(col = "white")
+
+```
+
+# What about without including FMP's in the MPA layer?
+
+```{r}
+exclusion_nofmp <- rast(here("new_data", "exclusion", "us_exclusion_nofmp.tif"))
+
+# plot(exclusion)
+# by downscaling to the proper res
+ex_nofmp_downscale <- terra::aggregate(exclusion_nofmp, fact = expansion, fun = "mean", na.rm = TRUE)
+# Then aligning the cells
+ex_nofmp_res <- terra::resample(ex_nofmp_downscale, template, method = "near") 
+
+m <- c(-Inf, 0, 0,
+       0.0000001, Inf, 1)
+
+rclmat <- matrix(m, ncol=3, byrow=TRUE)
+
+ex_nofmp_reclass <- ex_nofmp_res %>% 
+  terra::classify(rclmat)
+```
+
+
+```{r}
+
+# Calculate some cell statistics based on the exclusion layer
+# By first summing all the nitrogen/phosphorus in the water
+totalN <- raster(anthro_n_res)
+sumN <- raster::cellStats(totalN, "sum")
+
+totalP <- raster(anthro_p_res)
+sumP <- raster::cellStats(totalP, "sum")
+
+# Then calculating how much of that pollutant lies within suitable aquaculture area
+av_N_nfmp<- totalN * raster(ex_nofmp_reclass)
+av_P_nfmp <- totalP * raster(ex_nofmp_reclass)
+
+# First sum the total available N
+sum_avN_nfmp <- raster::cellStats(av_N_nfmp, "sum")
+sum_avP_nfmp <- raster::cellStats(av_P_nfmp, "sum")
+# Then calculate the percentage available
+pct_av_N_nfmp <- sum_avN_nfmp/sumN * 100
+pct_av_P_nfmp <- sum_avP_nfmp/sumN * 100
+```
+
+According to a quick calculation, only `r round(pct_av_N_nfmp, 2)`% of anthropogenic nitrogen inputs fall within available marine space, and only `r round(pct_av_P_nfmp, 2)`% phosphorus exists in available marine space.
+
+```{r}
+# Let's plot this:
+tm_shape(av_N_nfmp) +
+  tm_raster(style = "jenks", n = 12, title = "Nitrogen within available space (no FMP's) (kg/yr)",
+            palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+            legend.hist = TRUE) +
+  tm_shape(us_shp) +
+  tm_polygons(col = "white")
+
+
+tm_shape(av_P_nfmp) +
+    tm_raster(style = "jenks", n = 12, title = "Phosphorus within available space (no FMP's) (kg/yr)",
+            palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+            legend.hist = TRUE) +
+  tm_shape(us_shp) +
+  tm_polygons(col = "white")
+
+```

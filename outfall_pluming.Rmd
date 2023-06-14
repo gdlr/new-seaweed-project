@@ -1,0 +1,184 @@
+---
+title: "outfall_processing"
+author: "Gabriel De La Rosa"
+date: "7/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(raster)
+library(tidyverse)
+library(here)
+library(terra)
+
+rasterOptions(maxmemory = 1e10, progress = "text", timer = TRUE, memfrac = .7)
+```
+
+# This script plumes outfall nitrogen and phosphorus into the ocean across the whole us
+
+Load in ocean: 
+```{r}
+ocean <- raster(here("new_data", "GIS_output", "EEZ_reclass.tif"))
+```
+
+### Full outfalls
+```{r}
+# Forgot to add volume to OG file so I'll do this now:
+out_volume <- read_csv(here("outfalls_raw", "outfall_volume.csv")) %>% 
+  mutate(reg = as.numeric(reg))
+
+# Points we want to plume:
+points_fullN <- read_sf(here("outfalls_raw", "full_outfalls"), layer= "snapjoin_fullN") %>% 
+  mutate(REGISTR = as.numeric(REGISTR)) %>% 
+  full_join(out_volume, by = c("REGISTR" = "reg")) %>% 
+  st_transform(4326) %>% 
+ filter(NEAR_FID == 0,
+        lb_yr != 0) %>% 
+  distinct(.keep_all = TRUE)
+
+points_fullP <- read_sf(here("outfalls_raw", "full_outfalls"), layer = "snapjoin_fullP") %>% 
+  mutate(REGISTR = as.numeric(REGISTR)) %>% 
+  full_join(out_volume, by = c("REGISTR" = "reg")) %>% 
+  st_transform(4326) %>% 
+  filter(NEAR_FID == 0) %>% 
+  distinct(.keep_all = TRUE)
+
+# Names are from this:
+# conc_N <- read_csv(here("new_data", "outfall_n.csv"))
+
+## Daily flow is in Million Gallons/Year MGD
+## total load is in lbs/yr
+
+# Convert to CFS and kg/yr
+
+points_fullN_cfs <- points_fullN %>% 
+  mutate(dly_flw_cfs =  ann_flow_mgy * 0.00423617166) %>% 
+  mutate(kg_yrN = lb_yr * 0.453592) %>% 
+  drop_na(dly_flw_cfs, ann_flow_mgy, lb_yr) %>% 
+  st_as_sf()
+
+#plot(points_fullN_cfs)
+
+points_fullP_cfs <- points_fullP %>% 
+  mutate(dly_flw_cfs =  ann_flow_mgy * 0.00423617166) %>% 
+  mutate(kg_yrN = lb_yr * 0.453592) %>% 
+  drop_na(dly_flw_cfs, kg_yrN, lb_yr) %>% 
+  drop_na(dly_flw_cfs, ann_flow_mgy, lb_yr) %>% 
+  st_as_sf()
+
+```
+
+```{r}
+# Modify plume function:
+plume_fx <- function(points, raster, c = 0.5, b = 0.65, path){
+  
+  # points = test_points
+  # raster = ocean
+  # c = 0.5
+  # b = 0.65
+  
+    # Error Checking:
+  if(isLonLat(crs(points)) == FALSE) stop("check CRS, function only works for lon/lat. EPSG 4326 works.")
+  if(isLonLat(crs(raster)) == FALSE) stop("check CRS, function only works for lon/lat. EPSG 4326 works.")
+  
+    # So there's only one row:
+    for(i in 1:nrow(points)){
+    
+      test_pt <- points[i,]
+      name <- paste("plume_", i, ".tif", sep = "")
+      path2 <- paste(path, name, sep = "/")
+      
+      ### THIS HAPPENS ONCE
+      # Get which cell contains that point
+      cell <- cellFromXY(raster, st_coordinates(test_pt$geometry))
+      # Duplicate the OG raster
+      newraster <- raster
+      # Set point = 1
+      newraster[cell] <- 1
+      
+      # Calculate plume area: in KM2
+      # This is calculated in the plume_regression step
+        p_area <- .0145240 * test_pt$dly_flw_cfs + 7.4778210
+      
+      ### THIS REPEATS
+       tot_area <- 0
+       n_runs <- 1
+      repeat {
+        # get cell names for cells that are 1
+        newcell <- Which(newraster>=1, cells = TRUE)
+        # Find adjacent cells
+        adj <- adjacent(newraster, newcell, directions = 4, pairs = FALSE)
+        # Turn them into ones
+        newraster[adj] <- 1
+        # Create a new "newraster" with new ones:
+        newraster <- newraster+raster
+        tot_area <- sum(as.vector(area(newraster)*newraster), na.rm = TRUE)
+        n_runs <- n_runs+1
+        # Repeat function until the area is bigger than the plume:
+        if(tot_area >= p_area) break
+        if(n_runs == 1000) break}
+     
+    ###
+    ### PLUMING
+    ###
+       
+     # Then I actually need to plume these into the ocean.
+       
+     # Get the effluent as a value
+     effluent <- test_pt$kg_yrN
+     # Get the proportion of effluent included in each expansion
+     prop_eff <- effluent/n_runs
+     
+     # Create a plume raster:
+     p_raster <- raster
+     final <- raster
+     final[cell] <- prop_eff
+      # Set OG point = effluent
+     p_raster[cell] <- 1
+     # Then, loop through again:
+     p_runs <- 1
+     repeat{
+        # get cell names for cells that are 1
+        p_cell <- Which(final>=1, cells = TRUE)
+        # Find adjacent cells
+        adj <- adjacent(p_raster, p_cell, directions = 4, pairs = FALSE)
+        # Turn them into ones
+        p_raster[adj] <- 1
+        # Set OG cells to NA's
+        p_raster[p_cell] <- NA
+        # Get cell numbers for new cells
+        e_cell <- Which(p_raster>=1, cells = TRUE)
+        # Add effluent proportionally over the new cells
+        final[e_cell] <- prop_eff/length(e_cell)
+        final <- final + raster
+        
+        # Conditional for loop ending
+        p_runs <- p_runs+1
+        # Repeat function until the area is bigger than the plume:
+        if(p_runs >= n_runs) break
+        if(p_runs == 1000) break}
+     
+     writeRaster(final, path2, format = "GTiff", overwrite = TRUE)
+    }
+  }
+```
+
+```{r}
+# Create path for saving files
+path_fullN <- here("plume_outputs", "outfalls", "full_n")
+path_fullP <- here("plume_outputs", "outfalls", "full_p")
+
+# Run the plume function
+plume_fx(points_fullN_cfs, ocean, path = path_fullN)
+plume_fx(points_fullP_cfs, ocean, path = path_fullP)
+
+
+fullN_files <- list.files(path_fullN, full.names = TRUE)
+fullP_files <- list.files(path_fullP, full.names = TRUE)
+
+sum_fx(fullN_files, output = here("plume_outputs", "outfalls", "full_N.tif"))
+sum_fx(fullP_files, output = here("plume_outputs", "outfalls", "full_P.tif"))
+```

@@ -1,0 +1,2583 @@
+---
+title: "seaweed_uptake"
+author: "Gabriel De La Rosa"
+date: "7/22/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(raster)
+library(sf)
+library(terra)
+library(gstat)
+library(tmap)
+library(here)
+library(viridis)
+library(rnaturalearth)
+library(rgeos)
+```
+
+# Process natural nutrient inputs:
+```{r}
+# river nutrients
+# In kg/yr
+  anthro_riverN <- rast(here("plume_outputs", "nitrogen", "anthro_riverN.tif"))
+  anthro_riverP <- rast(here("plume_outputs", "phosphorous", "anthro_riverP.tif"))
+
+# outfall nutrients
+  # in kg/yr
+  # outfall_N <- rast(here("plume_outputs", "outfalls", "outfall_n.tif"))
+  out_full_N <- rast(here("plume_outputs", "outfalls", "full_n.tif"))
+  out_full_P <- rast(here("plume_outputs", "outfalls", "full_p.tif"))
+
+# Deposition
+  # in mgN/m2/yr
+  deposition <- rast(here("new_data", "from_nut_hotspots", "nit_dep_1993.tif"))
+  # Resample to .008x.008 degrees
+  dep_res <- terra::resample(deposition, anthro_riverN, method = "near")
+  # Compute cell size in m
+  a_008 <- terra::cellSize(anthro_riverN, unit = "m")
+  #plot(a_008)
+
+  # Convert units:
+  dep_kg <- dep_res * a_008 * (1/1000000)
+
+ # hist(dep_kg)
+
+# plot(dep_kg)
+
+# All together in kg/year, summing outfalls  and rivers
+
+  anthro_N <- dep_kg + anthro_riverN + out_full_N - dep_kg
+  anthro_P <- anthro_riverP + out_full_P
+
+  # plot(anthro_N)
+  # plot(anthro_P)
+```
+
+
+```{r, eval = TRUE}
+# Load in BO nitrogen:
+bo_nit <- raster(here("new_data", "from_nut_hotspots", "bo_nit_2dg.tif"))
+bo_phos <- raster(here("new_data", "from_nut_hotspots", "bo_phos_2dg.tif"))
+
+# Interpolate to the coasts:
+inter <- function(file){
+    r <- file             # Load in the raster
+    # grid <- raster::projectExtent(r, res = 0.2)
+    xy <- data.frame(xyFromCell(r, 1:ncell(r))) #create a df of the grid
+    v = getValues(r) # and a list of the values..
+    tmpdf <- cbind(xy, v)%>%filter(!is.na(v)) # Bind them together
+    mg <- gstat(id = "v", formula = v~1, locations = ~x+y, data=tmpdf,
+              nmax=7, set=list(idp = 2)) # Create a model (power function = 2)
+    z <- interpolate(r, mg, progress='text')
+}
+
+bo_interN <- inter(bo_nit) %>%
+  rast()
+
+bo_interP <- inter(bo_phos) %>%
+  rast()
+
+# Convert the concentration to kg/cell:
+# Original is in micromols/L
+
+##       1 umol/l * 62.0049 g/mol N * 1 mol/1e9 umol = gN/l * 1000 L/1m3 * 1kg/1000g
+
+n_conv <- 62.0049 * 1/1e9 * 1/1000 * 1000/1
+p_conv <- 94.9714 * 1/1e9 * 1/1000 * 1000/1
+
+# Convert the whole raster to kg/m3
+bo_p_kgm <- bo_interN * n_conv
+bo_P_kgm <- bo_interP * p_conv
+
+# Then multiply by the cell size to get just kg per cell:
+bo_Nkg <- bo_N_kgm * cellSize(bo_N_kgm)
+bo_Pkg <- bo_P_kgm * cellSize(bo_P_kgm)
+```
+
+```{r}
+# Create a natural nitrogen river plume layer:
+# Load in the total river nitrogen:
+riverN <- rast(here("plume_outputs", "us_tn_river.tif"))
+riverP <- rast(here("plume_outputs", "us_tp_river.tif"))
+
+nat_riverN <- riverN - anthro_riverN
+nat_riverP <- riverP - anthro_riverP
+
+# Reclassify so NA's don't give
+# Calculate expansion size
+expansion <- .2/.008
+# Create template 0.2 degree raster so we can keep coastal values
+template <- rast(crs = crs(bo_nit), res = res(bo_nit), extent = ext(bo_nit), vals = 0)
+
+nat_riverN_downscale <- terra::aggregate(nat_riverN, fact = expansion, fun = "mean", na.rm = TRUE)
+nat_riverP_downscale <- terra::aggregate(nat_riverP, fact = expansion, fun = "mean", na.rm = TRUE)
+
+# Then aligning the cells
+nat_riverN_res <- terra::resample(nat_riverN_downscale, template, method = "near")
+nat_riverP_res <- terra::resample(nat_riverP_downscale, template, method = "near")
+
+# Now we can add the kg introduced by rivers to the BO plume layer in kg:
+naturalN <- bo_Nkg + nat_riverN_res
+naturalP <- bo_Pkg + nat_riverP_res
+
+# plot(riverP)
+#
+# plot(anthro_riverP)
+
+```
+
+# Process anthropogenic inputs:
+
+# These two are the raw nutrient plumes we've got
+```{r}
+# Aggregate the anthro n layer to 0.2 degree cells, summing values
+anthro_n_downscale <- terra::aggregate(anthro_N, fact = expansion, fun = "sum", na.rm = TRUE)
+anthro_p_downscale <- terra::aggregate(anthro_P, fact = expansion, fun = "sum", na.rm = TRUE)
+
+```
+
+
+
+# Plotting the anthropogenic nutrient pollution without any exclusion
+
+```{r}
+# Creating the countries for a basemap:
+us_shp <- st_read(here("new_data", "us_shapefile", "US_mainland.shp"))
+whole_extent <- extent(c(-129.235025705, -65.699025705, 23.829413411, 49.093413411))
+
+canada <- st_as_sf(ne_countries(country = "Canada", scale = "large")) %>% 
+  st_crop(whole_extent)
+mexico <- st_as_sf(ne_countries(country = "Mexico", scale = "large")) %>% 
+  st_crop(whole_extent)
+us <- st_as_sf(ne_countries(country = "United States of America", scale = "large")) %>% 
+  st_crop(whole_extent)
+```
+```{r}
+# bounding box coordinates
+pacific <- extent(c(-129.235025705, -110, 30, 49.093413411))
+
+# Pacific:
+canada_pac <- st_as_sf(ne_countries(country = "Canada", scale = "large")) %>% 
+  st_crop(pacific)
+mexico_pac <- st_as_sf(ne_countries(country = "Mexico", scale = "large")) %>% 
+  st_crop(pacific)
+us_pac <- st_as_sf(ne_countries(country = "United States of America", scale = "large")) %>% 
+  st_crop(pacific)
+
+
+atlantic <- extent(c(-100, -65.699025705, 23.829413411, 49.093413411))
+
+# Alantic:
+canada_atl <- st_as_sf(ne_countries(country = "Canada", scale = "large")) %>% 
+  st_crop(atlantic)
+mexico_atl <- st_as_sf(ne_countries(country = "Mexico", scale = "large")) %>% 
+  st_crop(atlantic)
+us_atl <- st_as_sf(ne_countries(country = "United States of America", scale = "large")) %>% 
+  st_crop(atlantic)
+
+# Northeast
+saccharina_atlantic <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Saccharina") %>% 
+  sf::st_crop(atlantic)
+
+canada_ne <- st_as_sf(ne_countries(country = "Canada", scale = "large")) %>% 
+  st_crop(saccharina_atlantic)
+mexico_ne <- st_as_sf(ne_countries(country = "Mexico", scale = "large")) %>% 
+  st_crop(saccharina_atlantic)
+us_ne <- st_as_sf(ne_countries(country = "United States of America", scale = "large")) %>% 
+  st_crop(saccharina_atlantic)
+
+```
+
+
+
+```{r}
+# Transformation for plotting:
+anthro_n_rast <- raster(anthro_n_downscale)
+anthro_n_rast_df <- as.data.frame(anthro_n_rast, xy = TRUE) %>% drop_na()
+
+anthro_n_fine_rast <- raster(anthro_N)
+anthro_n_fine_rast_df <- as.data.frame(anthro_n_rast, xy = TRUE) %>% drop_na()
+
+#hist(anthro_n_fine_rast_df$nit_dep_1993)
+
+# 0.08 x 0.08 degree plot
+
+# whole_us_pollution_08 <- 
+#   ggplot() +
+#   geom_raster(data = anthro_n_fine_rast_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+#   geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+#   geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+#   geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+#   theme_void() +
+#   theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+#   labs(title = "Anthropogenic N in the United States (kg/yr)", x = NULL, y = NULL) +
+#   scale_x_continuous(expand = c(0,0)) +
+#     scale_y_continuous(expand = c(0,0)) +
+#   scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# 0.2 x 0.2 degree plot
+whole_us_pollution_2 <- ggplot() +
+  geom_raster(data = anthro_n_rast_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic N in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+
+# Pacific highlight: 
+
+anthro_n_rast_pacific <- raster::crop(anthro_n_rast, pacific)
+anthro_n_rast_pacific_df <- as.data.frame(anthro_n_rast_pacific, xy = TRUE) %>% drop_na()
+
+
+pacific_anthro_nitro_pollution <- 
+  ggplot() +
+  geom_raster(data = anthro_n_rast_pacific_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us_pac$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_pac$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_pac$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic N in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Atlantic highlight
+anthro_n_rast_atlantic <- raster::crop(anthro_n_rast, atlantic)
+anthro_n_rast_atlantic_df <- as.data.frame(anthro_n_rast_atlantic, xy = TRUE) %>% drop_na()
+
+atlantic_anthro_nitro_pollution <- 
+  ggplot() +
+  geom_raster(data = anthro_n_rast_atlantic_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us_atl$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_atl$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_atl$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic N in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# SoCal Bight
+
+socal <- extent(c(-123, -115, 30, 35))
+
+anthro_n_rast_socal <- raster::crop(anthro_n_rast, socal)
+anthro_n_rast_socal_df <- as.data.frame(anthro_n_rast_socal, xy = TRUE) %>% drop_na()
+
+canada_socal <- st_as_sf(ne_countries(country = "Canada", scale = "large")) %>% 
+  st_crop(socal)
+mexico_socal <- st_as_sf(ne_countries(country = "Mexico", scale = "large")) %>% 
+  st_crop(socal)
+us_socal <- st_as_sf(ne_countries(country = "United States of America", scale = "large")) %>% 
+  st_crop(socal)
+
+socal_anthro_nitro_pollution <- ggplot() +
+  geom_raster(data = anthro_n_rast_socal_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic N in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", trans = "log", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), limits = c(1, 120653423))
+
+# anthro_n_rast_socal_fine <- raster::crop(anthro_n_fine_rast, socal)
+# anthro_n_rast_socal_df_fine <- as.data.frame(anthro_n_rast_socal_fine, xy = TRUE) %>% drop_na()
+# 
+# max(anthro_n_rast_socal_df_fine$nit_dep_1993)
+# 
+# ggplot() +
+#   geom_raster(data = anthro_n_rast_socal_df_fine, aes(x = x, y = y, fill = nit_dep_1993)) +
+#   geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+#   geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+#   geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+#   theme_void() +
+#   theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+#   labs(title = "Anthropogenic N in the United States (kg/yr)", x = NULL, y = NULL) +
+#   scale_x_continuous(expand = c(0,0)) +
+#     scale_y_continuous(expand = c(0,0)) +
+#   scale_fill_viridis(option = "magma", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), limits = c(1, 11655982))
+
+# Northeast highlight
+
+anthro_n_rast_ne <- raster::crop(anthro_n_rast, saccharina_atlantic)
+anthro_n_rast_ne_df <- as.data.frame(anthro_n_rast_ne, xy = TRUE) %>% drop_na()
+
+northeast_anthro_nitro_pollution <- ggplot() +
+  geom_raster(data = anthro_n_rast_ne_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us_ne$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_ne$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_ne$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic N in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+```
+
+```{r}
+whole_us_pollution_2
+northeast_anthro_nitro_pollution
+socal_anthro_nitro_pollution
+atlantic_anthro_nitro_pollution
+pacific_anthro_nitro_pollution
+
+ggsave(plot = whole_us_pollution_2, filename = here("figures","no_dep", "whole_us_pollution_2.png"))
+ggsave(plot = northeast_anthro_nitro_pollution, filename = here("figures","no_dep", "northeast_anthro_nitro_pollution.png"))
+ggsave(plot = socal_anthro_nitro_pollution, filename = here("figures", "no_dep", "socal_anthro_nitro_pollution.png"))
+ggsave(plot = atlantic_anthro_nitro_pollution, filename = here("figures","no_dep", "atlantic_anthro_nitro_pollution.png"))
+ggsave(plot = pacific_anthro_nitro_pollution, filename = here("figures","no_dep", "pacific_anthro_nitro_pollution.png"))
+```
+# Make some histograms for these data
+
+```{r}
+#whole_us_pollution_histogram <- 
+
+anthro_n_histogram_us <- ggplot(data = anthro_n_rast_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 2100)) +
+  theme_bw() +
+  labs(title = "Histogram of anthropogenic nitrogen load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency")
+# Pacific
+anthro_n_histogram_pacific <- ggplot(data = anthro_n_rast_pacific_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1100)) +
+  theme_bw() +
+  labs(title = "Histogram of Pacific anthropogenic nitrogen load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency")
+
+# Atlantic
+anthro_n_histogram_atlantic <- ggplot(data = anthro_n_rast_atlantic_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1100)) +
+  theme_bw() +
+  labs(title = "Histogram of Atlantic anthropogenic nitrogen load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency")
+
+# Socal
+anthro_n_histogram_socal <- ggplot(data = anthro_n_rast_socal_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Histogram of Southern California anthropogenic nitrogen \nload (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency")
+
+# Northeast
+anthro_n_histogram_ne <- ggplot(data = anthro_n_rast_ne_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Histogram of NE anthropogenic nitrogen \nload (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency")
+```
+
+
+```{r}
+anthro_n_histogram_us
+anthro_n_histogram_pacific
+anthro_n_histogram_atlantic
+anthro_n_histogram_socal
+anthro_n_histogram_ne
+
+ggsave(plot = anthro_n_histogram_us, filename = here("figures", "no_dep","anthro_n_histogram_us.png"))
+ggsave(plot = anthro_n_histogram_pacific, filename = here("figures", "no_dep","anthro_n_histogram_pacific.png"))
+ggsave(plot = anthro_n_histogram_atlantic, filename = here("figures", "no_dep","socal_anthro_nitro_pollution.png"))
+ggsave(plot = atlantic_anthro_nitro_pollution, filename = here("figures", "no_dep","anthro_n_histogram_atlantic.png"))
+ggsave(plot = anthro_n_histogram_socal, filename = here("figures", "no_dep","anthro_n_histogram_socal.png"))
+```
+
+
+
+```{r}
+  
+# Resample it to the BO layer so the cells align completely
+anthro_n_res <- terra::resample(anthro_n_downscale, template, method = "near")
+anthro_p_res <- terra::resample(anthro_p_downscale, template, method = "near")
+# plot(anthro_n_res)
+
+# 
+# # So do it without:
+noriverN <- anthro_n_res/bo_Nkg #max 4829967
+noriverP <- anthro_p_res/bo_Pkg # max 11403262
+
+plot(noriverN)
+# 
+# plot(ratio)
+# plot(ratioP)
+# 
+# terra::writeRaster(ratio, here("analysis_outputs", "anthro_N_ratio.tif"), overwrite = TRUE)
+# terra::writeRaster(ratioP, here("analysis_outputs", "anthro_P_ratio.tif"), overwrite = TRUE)
+
+```
+
+
+```{r}
+# Whole US:
+n_ratio_us_df <- as.data.frame(noriverN, xy = TRUE) %>% drop_na()
+
+n_ratio_us_plot <- 
+  ggplot() +
+  geom_raster(data = n_ratio_us_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural nitrogen ratio ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Pacific
+
+n_ratio_pacific <- raster::crop(noriverN, pacific)
+n_ratio_pacific_df <- as.data.frame(n_ratio_pacific, xy = TRUE) %>% drop_na()
+
+n_ratio_pacific_plot <- ggplot() +
+  geom_raster(data = n_ratio_pacific_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us_pac$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_pac$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_pac$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural nitrogen ratio", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+
+
+# Socal
+
+n_ratio_socal <- raster::crop(noriverN, socal)
+n_ratio_socal_df <- as.data.frame(n_ratio_socal, xy = TRUE) %>% drop_na()
+
+n_ratio_socal_plot <- ggplot() +
+  geom_raster(data = n_ratio_socal_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural nitrogen ratio", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Atlantic
+n_ratio_atl <- raster::crop(noriverN, atlantic)
+n_ratio_atl_df <- as.data.frame(n_ratio_atl, xy = TRUE) %>% drop_na()
+
+n_ratio_atl_plot <- ggplot() +
+  geom_raster(data = n_ratio_atl_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us_atl$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_atl$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_atl$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural nitrogen ratio", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Northeast
+n_ratio_ne <- raster::crop(noriverN, saccharina_atlantic)
+n_ratio_ne_df <- as.data.frame(n_ratio_ne, xy = TRUE) %>% drop_na()
+
+n_ratio_ne_plot <- ggplot() +
+  geom_raster(data = n_ratio_ne_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  geom_sf(data = us_ne$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_ne$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_ne$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural nitrogen ratio", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+```
+
+
+
+# Plot these ratios:
+```{r}
+# plotting
+n_ratio_us_plot
+n_ratio_pacific_plot
+n_ratio_socal_plot
+n_ratio_atl_plot
+n_ratio_ne_plot
+
+
+ggsave(plot = n_ratio_us_plot, filename = here("figures", "no_dep","n_ratio_us_plot.png"))
+ggsave(plot = n_ratio_pacific_plot, filename = here("figures", "no_dep","n_ratio_pacific_plot.png"))
+ggsave(plot = n_ratio_socal_plot, filename = here("figures", "no_dep","n_ratio_socal_plot.png"))
+ggsave(plot = n_ratio_atl_plot, filename = here("figures", "no_dep","n_ratio_atl_plot.png"))
+ggsave(plot = n_ratio_ne_plot, filename = here("figures", "no_dep","n_ratio_ne_plot.png"))
+```
+# Histogram of the ratios:
+
+```{r}
+
+#whole_us_n_ratio_histogram <- 
+n_ratio_us_hist <- ggplot(data = n_ratio_us_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1000)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, whole US",
+       x = "Anthropogenic to natural N ratio", y = "Frequency")
+
+# Pacific
+n_ratio_pac_hist <- ggplot(data = n_ratio_pacific_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 750)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, Pacific",
+       x = "Anthropogenic to natural N ratio", y = "Frequency")
+
+# Atlantic
+n_ratio_atl_hist <- ggplot(data = n_ratio_atl_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 800)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, Atlantic",
+       x = "Anthropogenic to natural N ratio", y = "Frequency")
+
+# Socal
+n_ratio_socal_hist <- ggplot(data = anthro_n_rast_socal_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 250)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, Southern California",
+       x = "Anthropogenic to natural N ratio", y = "Frequency")
+
+# Northeast
+n_ratio_ne_hist <- ggplot(data = anthro_n_rast_ne_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, Northeast",
+       x = "Anthropogenic to natural N ratio", y = "Frequency")
+```
+
+```{r}
+n_ratio_us_hist
+n_ratio_pac_hist
+n_ratio_atl_hist
+n_ratio_socal_hist
+n_ratio_ne_hist
+
+ggsave(plot = n_ratio_us_hist, filename = here("figures", "no_dep","n_ratio_us_hist.png"))
+ggsave(plot = n_ratio_pac_hist, filename = here("figures", "no_dep","n_ratio_pacific_hist.png"))
+ggsave(plot = n_ratio_socal_hist, filename = here("figures", "no_dep","n_ratio_socal_hist.png"))
+ggsave(plot = n_ratio_atl_hist, filename = here("figures", "no_dep","n_ratio_atl_hist.png"))
+ggsave(plot = n_ratio_ne_hist, filename = here("figures", "no_dep","n_ratio_ne_hist.png"))
+```
+
+
+## Nitrogen available with our exclusion analysis:
+
+### Add in exclusion:
+```{r}
+# Turn the exclusion layer into a 2 degree grid
+# exclusion <- rast(here("new_data", "exclusion", "us_exclusion.tif"))
+
+# template = rast(anthro_n_rast)
+
+exclusion <- rast(here("new_data", "exclusion", "us_exclusion_nofmp.tif"))
+
+# plot(exclusion)
+# by downscaling to the proper res
+exclusion_downscale <- terra::aggregate(exclusion, fact = expansion, fun = "mean", na.rm = TRUE)
+# Then aligning the cells
+exclusion_res <- terra::resample(exclusion_downscale, template, method = "near") 
+
+m <- c(
+       0.0000001, Inf, 1)
+
+rclmat <- matrix(m, ncol=3, byrow=TRUE)
+
+exclusion_reclass <- exclusion_res %>% 
+  terra::classify(rclmat)
+
+plot(exclusion_reclass)
+# Replace 0 with NA
+exclusion_reclass <- classify(exclusion_reclass, cbind(0, NA))
+plot(exclusion_reclass)
+```
+### Then, repeat with excluded zones:
+
+```{r}
+anthro_n_rast_us <-raster(anthro_n_downscale)
+
+exclusion_reclass <- raster(exclusion_reclass)
+extent(exclusion_reclass) <- extent(anthro_n_rast_us)
+
+plot(exclusion_reclass)
+
+
+# Multiply then select for each zone:
+
+
+anthro_n_rast_us_exclusion <- anthro_n_rast_us * exclusion_reclass
+anthro_n_rast_ne_exclusion <- crop(anthro_n_rast_us_exclusion, saccharina_atlantic)
+anthro_n_rast_atlantic_exclusion <- crop(anthro_n_rast_us_exclusion, atlantic)
+anthro_n_rast_socal_exclusion <- crop(anthro_n_rast_us_exclusion, socal)
+anthro_n_rast_pacific_exclusion <- crop(anthro_n_rast_us_exclusion, pacific)
+
+# Turn them into data frames
+anthro_n_rast_us_exclusion_df <- as.data.frame(anthro_n_rast_us_exclusion, xy = TRUE) %>% drop_na()
+anthro_n_rast_ne_exclusion_df <- as.data.frame(anthro_n_rast_ne_exclusion, xy = TRUE) %>% drop_na()
+anthro_n_rast_atlantic_exclusion_df <- as.data.frame(anthro_n_rast_atlantic_exclusion, xy = TRUE) %>% drop_na()
+anthro_n_rast_socal_exclusion_df <- as.data.frame(anthro_n_rast_socal_exclusion, xy = TRUE) %>% drop_na()
+anthro_n_rast_pacific_exclusion_df <- as.data.frame(anthro_n_rast_pacific_exclusion, xy = TRUE) %>% drop_na()
+
+# Plot them
+
+#Whole US
+n_exclusion_us <- ggplot() +
+  geom_raster(data = anthro_n_rast_us_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Northeast
+n_exclusion_ne <- ggplot() +
+  geom_raster(data = anthro_n_rast_ne_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_ne$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_ne$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_ne$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Atlantic
+n_exclusion_atl <- ggplot() +
+  geom_raster(data = anthro_n_rast_atlantic_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_atl$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_atl$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_atl$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Pacific
+n_exclusion_pac <- ggplot() +
+  geom_raster(data = anthro_n_rast_pacific_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_pac$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_pac$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_pac$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# socal
+n_exclusion_socal <- ggplot() +
+  geom_raster(data = anthro_n_rast_socal_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+```
+
+```{r}
+n_exclusion_us
+n_exclusion_atl
+n_exclusion_pac
+n_exclusion_socal
+n_exclusion_ne
+
+ggsave(plot = n_exclusion_us, filename = here("figures", "no_dep","n_exclusion_us.png"))
+ggsave(plot = n_exclusion_atl, filename = here("figures", "no_dep","n_exclusion_atl.png"))
+ggsave(plot = n_exclusion_pac, filename = here("figures", "no_dep","n_exclusion_pac.png"))
+ggsave(plot = n_exclusion_socal, filename = here("figures", "no_dep","n_exclusion_socal.png"))
+ggsave(plot = n_exclusion_ne, filename = here("figures", "no_dep","n_exclusion_ne.png"))
+```
+
+
+# Add the available nitrogen to the OG nitrogen historgrams
+```{r}
+#whole_us_pollution_histogram <- 
+
+n_exclusion_hist_us <- ggplot()+
+  geom_histogram(data = anthro_n_rast_df, aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 2100)) +
+  theme_bw() +
+  labs(title = "Histogram of anthropogenic nitrogen load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_n_rast_us_exclusion_df, aes(x = layer), fill = "forestgreen", color = "grey80")
+
+# Pacific
+n_exclusion_hist_pac <- ggplot(data = anthro_n_rast_pacific_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1100)) +
+  theme_bw() +
+  labs(title = "Histogram of Pacific anthropogenic nitrogen load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_n_rast_pacific_exclusion_df, aes(x = layer), fill = "forestgreen", color = "grey80")
+
+# Atlantic
+n_exclusion_hist_atlantic <- ggplot(data = anthro_n_rast_atlantic_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1100)) +
+  theme_bw() +
+  labs(title = "Histogram of Atlantic anthropogenic nitrogen load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_n_rast_atlantic_exclusion_df, aes(x = layer), fill = "forestgreen", color = "grey80")
+
+# Socal
+n_exclusion_hist_socal <- ggplot(data = anthro_n_rast_socal_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Histogram of Southern California anthropogenic nitrogen \nload (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_n_rast_socal_exclusion_df, aes(x = layer), fill = "blue", color = "grey80")
+
+# Northeast
+n_exclusion_hist_ne <- ggplot(data = anthro_n_rast_ne_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Histogram of NE anthropogenic nitrogen \nload (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic nitrogen (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_n_rast_ne_exclusion_df, aes(x = layer), fill = "blue", color = "grey80")
+```
+
+```{r}
+n_exclusion_hist_us
+n_exclusion_hist_pac
+n_exclusion_hist_atlantic
+n_exclusion_hist_ne
+n_exclusion_hist_socal
+
+ggsave(plot = n_exclusion_hist_us, filename = here("figures", "no_dep","n_exclusion_hist_us.png"))
+ggsave(plot = n_exclusion_hist_pac, filename = here("figures", "no_dep","n_exclusion_hist_pac.png"))
+ggsave(plot = n_exclusion_hist_atlantic, filename = here("figures", "no_dep","n_exclusion_hist_atlantic.png"))
+ggsave(plot = n_exclusion_hist_ne, filename = here("figures", "no_dep","n_exclusion_hist_ne.png"))
+ggsave(plot = n_exclusion_hist_socal, filename = here("figures", "no_dep","n_exclusion_hist_socal.png"))
+```
+
+
+# Repeat for the ratios:
+
+```{r}
+n_ratio_us <- raster(noriverN)
+n_ratio_us <- resample(n_ratio_us, exclusion_reclass) # gets rid of some origin weirdness...
+
+# Multiply then select for each zone:
+anthro_n_ratio_us_exclusion <- n_ratio_us * exclusion_reclass
+anthro_n_ratio_ne_exclusion <- crop(anthro_n_ratio_us_exclusion, saccharina_atlantic)
+anthro_n_ratio_atlantic_exclusion <- crop(anthro_n_ratio_us_exclusion, atlantic)
+anthro_n_ratio_socal_exclusion <- crop(anthro_n_ratio_us_exclusion, socal)
+anthro_n_ratio_pacific_exclusion <- crop(anthro_n_ratio_us_exclusion, pacific)
+
+# Turn them into data frames
+anthro_n_ratio_us_exclusion_df <- as.data.frame(anthro_n_ratio_us_exclusion, xy = TRUE) %>% drop_na()
+anthro_n_ratio_ne_exclusion_df <- as.data.frame(anthro_n_ratio_ne_exclusion, xy = TRUE) %>% drop_na()
+anthro_n_ratio_atlantic_exclusion_df <- as.data.frame(anthro_n_ratio_atlantic_exclusion, xy = TRUE) %>% drop_na()
+anthro_n_ratio_socal_exclusion_df <- as.data.frame(anthro_n_ratio_socal_exclusion, xy = TRUE) %>% drop_na()
+anthro_n_ratio_pacific_exclusion_df <- as.data.frame(anthro_n_ratio_pacific_exclusion, xy = TRUE) %>% drop_na()
+```
+
+# Plotting 
+
+```{r}
+# Plot them
+
+#Whole US
+n_ratio_exclusion_us <- ggplot() +
+  geom_raster(data = anthro_n_ratio_us_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+# Northeast
+n_ratio_exclusion_ne <- ggplot() +
+  geom_raster(data = anthro_n_ratio_ne_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_ne$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_ne$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_ne$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+# Atlantic
+n_ratio_exclusion_atl <- ggplot() +
+  geom_raster(data = anthro_n_ratio_atlantic_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_atl$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_atl$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_atl$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+# Pacific
+n_ratio_exclusion_pac <- ggplot() +
+  geom_raster(data = anthro_n_ratio_pacific_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_pac$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_pac$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_pac$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+# socal
+n_ratio_exclusion_socal <- ggplot() +
+  geom_raster(data = anthro_n_ratio_socal_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+```
+
+```{r}
+n_ratio_exclusion_us
+n_ratio_exclusion_ne
+n_ratio_exclusion_pac
+n_ratio_exclusion_socal
+n_ratio_exclusion_atl
+
+ggsave(plot = n_ratio_exclusion_us, filename = here("figures", "no_dep","n_ratio_exclusion_us.png"))
+ggsave(plot = n_ratio_exclusion_ne, filename = here("figures", "no_dep","n_ratio_exclusion_ne.png"))
+ggsave(plot = n_ratio_exclusion_pac, filename = here("figures", "no_dep","n_ratio_exclusion_pac.png"))
+ggsave(plot = n_ratio_exclusion_socal, filename = here("figures", "no_dep","n_ratio_exclusion_socal.png"))
+ggsave(plot = n_ratio_exclusion_atl, filename = here("figures", "no_dep","n_ratio_exclusion_atl.png"))
+```
+
+
+```{r}
+# US
+n_ratio_exclusion_hist_us <- ggplot()+
+  geom_histogram(data = n_ratio_us_df,aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1000)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, whole US",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_n_ratio_us_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+  
+
+# Pacific
+n_ratio_exclusion_hist_pac <- ggplot(data = n_ratio_pacific_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 750)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, Pacific",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_n_ratio_pacific_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+
+# Atlantic
+n_ratio_exclusion_hist_atl <- ggplot(data = n_ratio_atl_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 800)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, Atlantic",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_n_ratio_atlantic_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+
+# Socal
+n_ratio_exclusion_hist_socal <- ggplot(data = n_ratio_socal_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 250)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, Southern California",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_n_ratio_socal_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+
+# Northeast
+n_ratio_exclusion_hist_ne <- ggplot(data =n_ratio_ne_df)+
+  geom_histogram(aes(x = nit_dep_1993), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural nitrogen, Northeast",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_n_ratio_ne_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+```
+
+```{r}
+n_ratio_exclusion_hist_us
+n_ratio_exclusion_hist_ne
+n_ratio_exclusion_hist_pac
+n_ratio_exclusion_hist_socal
+n_ratio_exclusion_hist_atl
+
+ggsave(plot = n_ratio_exclusion_hist_us, filename = here("figures", "no_dep","n_ratio_exclusion_hist_us.png"))
+ggsave(plot = n_ratio_exclusion_hist_ne, filename = here("figures", "no_dep","n_ratio_exclusion_hist_ne.png"))
+ggsave(plot = n_ratio_exclusion_hist_pac, filename = here("figures", "no_dep","n_ratio_exclusion_hist_pac.png"))
+ggsave(plot = n_ratio_exclusion_hist_socal, filename = here("figures", "no_dep","n_ratio_exclusion_hist_socal.png"))
+ggsave(plot = n_ratio_exclusion_hist_atl, filename = here("figures", "no_dep","n_ratio_exclusion_hist_atl.png"))
+```
+
+### WOOHOO done with the nitrogen loading figures
+
+
+# Seaweed theoretical uptake:
+
+## Let's see where seaweed species can actually grow:
+
+```{r}
+area <- extent(c(-129.235025705, -65.699025705, 23.829413411, 49.093413411))
+
+eucheuma <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Eucheuma") %>% 
+  sf::st_crop(area)
+
+saccharina <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Saccharina") %>% 
+  sf::st_crop(area)
+
+gracilaria <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Gracilaria") %>% 
+  sf::st_crop(area)
+
+macrocystis <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Macrocystis") %>% 
+  sf::st_crop(area)
+```
+
+```{r}
+# seaweed range plot
+
+eucheuma_range <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  geom_sf(data = eucheuma, color = "yellow", lwd = 1) +
+  labs(title = "Eucheuma range ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0))
+
+gracilaria_range <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  geom_sf(data = gracilaria, color = "chartreuse3", lwd = 1) +
+  labs(title = "Gracilaria range ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0))
+
+saccharina_range <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  geom_sf(data = saccharina, color = "goldenrod", lwd = 1) +
+  labs(title = "Saccharina range ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0))
+
+macrocystis_range <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  geom_sf(data = macrocystis, color = "darkgoldenrod", lwd = 1) +
+  labs(title = "Macrocystis range ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0))
+
+eucheuma_range
+gracilaria_range
+saccharina_range
+macrocystis_range
+
+ggsave(plot = eucheuma_range, filename = here("figures", "no_dep","seaweed_range_maps", "eucheuma_range.png"))
+ggsave(plot = gracilaria_range, filename = here("figures", "no_dep","seaweed_range_maps","gracilaria_range.png"))
+ggsave(plot = saccharina_range, filename = here("figures","seaweed_range_maps", "saccharina_range.png"))
+ggsave(plot = macrocystis_range, filename = here("figures","seaweed_range_maps", "macrocystis_range.png"))
+```
+
+# Now that we know the ranges, we can partition our model to include both...
+
+```{r}
+# bounding box coordinates
+
+atlantic <- extent(c(-100, -65.699025705, 23.829413411, 49.093413411))
+pacific <- extent(c(-129.235025705, -100, 23.829413411, 49.093413411))
+
+# Create the polygons:
+
+# Saccharina
+saccharina_poly <- rgeos::bbox2SP(n =  49.1  , s = 40.4, w =-81.3,e = -65.7 ) %>% 
+  st_as_sf()
+
+# Eucheuma
+eucheuma_poly <- rgeos::bbox2SP(n =  40.4  , s = 24, w =-81.3,e = -65.7 ) %>% 
+  st_as_sf()
+
+# Gracilaria
+gracilaria_poly <- rgeos::bbox2SP(n =  35  , s = 24, w =-100, e = -81.3) %>% 
+  st_as_sf()
+
+# Macrocystis
+macrocystis_poly <- rgeos::bbox2SP(n =  49.1  , s = 30, w =-129,e = -115 ) %>% 
+  st_as_sf
+
+```
+
+
+```{r}
+seaaweed_aquaculture_boxes <- ggplot() +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Seaweed aquaculture ranges ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  geom_sf(data = saccharina_poly$geometry, fill = NA, color = "goldenrod") +
+  geom_sf(data = eucheuma_poly$geometry, fill = NA, color = "yellow") +
+  geom_sf(data = gracilaria_poly$geometry, fill = NA, color = "chartreuse3") +
+  geom_sf(data = macrocystis_poly$geometry, fill = NA, color = "darkgoldenrod")
+
+seaaweed_aquaculture_boxes
+
+ggsave(plot = seaaweed_aquaculture_boxes, filename = here("figures", "no_dep","seaweed_range_maps", "seaweed_aquaculture_boxes.png"))
+```
+
+```{r}
+# Create some extents:
+
+# Saccharina & gracilaria
+saccharina_extent <- extent(saccharina_poly)
+
+# Eucheuma
+eucheuma_extent <- extent(eucheuma_poly)
+
+# Gracilaria
+gracilaria_extent <- extent(gracilaria_poly)
+
+# Macrocystis
+macrocystis_extent <- extent(macrocystis_poly)
+```
+
+
+
+
+
+
+# Gracilaria
+```{r}
+# Gracilaria
+# Estimated at 5.8-6.9 t/ha/yr
+# From https://www.sciencedirect.com/science/article/pii/0044848689900264
+# Gyeild <-  6.9 * 100 # tonsSeaweed/ha * 100 ha/1km2 = tons_seaweed/km2
+# Gn_uptake = .039 * Gyeild # = tonsN/km2 
+# Gn_kg = Gn_uptake * 907.185 # kg/km2
+# G_uptake <- Gn_kg
+
+# Long Island Sound calculated a true removal of around 28-94 kg/ha per 90 day season - about half of a full season
+# https://www.sciencedirect.com/science/article/abs/pii/S0044848614002658
+# 94 kg/ha * 100ha/km2 = 9400 kg/km2
+# or about 18,800 kg/km2
+
+G_uptake <- 18800 # kg/km
+
+# Our minimum was 1,101,328 kg/ha, so off by like a huge order of magnitude. Going with the LIS published amounts...
+```
+
+# Eucheuma
+```{r}
+# Eucheuma: 8-12 tons per HA
+# 1000 dry tons per km2 from WorldBank
+#https://documents1.worldbank.org/curated/en/947831469090666344/pdf/107147-WP-REVISED-Seaweed-Aquaculture-Web.pdf
+# Tissue content = 0.017
+# cell_km <- cell_m * .0000001
+# yeild <- cell_km * 1000 # tonsSeaweed/ km
+# n_uptake = .017 * yeild # tonsN/km
+# n_kg = n_uptake * 907.185
+# eucheuma_uptake <- n_kg
+
+
+#1000 tons/km = 10 tons/ha
+
+# eucheuma uptake = G_uptake * eucheuma_tissue_content/gracilaria_tissue_content * eucheuma_yield/gracilaria_yeild
+
+eucheuma_uptake <- G_uptake * 0.017/0.039 * 10/7 # kg/km
+```
+
+# Macrocystis
+```{r}
+# Macrocystis
+    # Yeild is 100 tonnes/ha/yr from Buschmann, 2014 The Status of Kelp Exploitation and Marine Agronomy
+    # https://www.researchgate.net/publication/329602577_Revisiting_the_economic_profitability_of_giant_kelp_Macrocystis_pyrifera_Ochrophyta_cultivation_in_Chile
+    # Myeild <- cell_km * 200 * 100 # tons/ha * 100 ha/1km2 = tons/km2
+    # Mn_uptake = .03 * Myeild # tonsN/km2 (Yeild x tissue content)
+    # Mn_kg = Mn_uptake * 907.185
+
+# Giant kelp has slightly lower tissue content than gracilaria
+# but a much higher yield - 100/7
+
+  # gracilaria uptake * kelp_tissue_content/gracilaria_tissue_content * kelp_yield/gracilaria_yeild
+
+kelp_uptake <- G_uptake * 0.03/0.039 * 100/7 #kg/km
+
+```
+
+# Saccharina
+
+According to the Long Island Sound study, saccharina maximum uptake is around 18,000 kg/km per season
+```{r}
+# For saccharina:
+# 2500 kg/ha/yr * 1ha/0.01km2
+# sac_cell_remove <- 2500 * 1/.01 # = 250,000 # kg/cell/year
+
+
+# https://www.semanticscholar.org/paper/Use-of-sugar-kelp-aquaculture-in-Long-Island-Sound-Kim-Kraemer/01f9ea5b15a171ac2c83dcb8a8745f56705ad02d
+# Long island sound estimates 180 kgN/ha removed from saccharina
+
+# 180 kg/ha * 100ha/km2 = 18,000 kg.km2
+sac_uptake <- 18000
+
+```
+
+
+```{r}
+G_uptake
+sac_uptake
+kelp_uptake
+eucheuma_uptake
+ 
+
+# Calculate the average cell area for multiplication:
+
+avg_cell_area <- area(anthro_n_rast_us_exclusion) %>% 
+  as.data.frame(xy = TRUE) %>% drop_na()
+
+avg_cell_km2 <- mean(avg_cell_area$layer)
+```
+
+# Let's look at kelp in Southern California first:
+
+
+```{r}
+n_remaining_kelp_uptake <- anthro_n_rast_socal_exclusion - (kelp_uptake*avg_cell_km2)
+
+plot(anthro_n_rast_socal_exclusion) # max = 4,289,684
+plot(n_remaining_kelp_uptake) # max = 4,083,091
+```
+
+```{r}
+# Take the US exclusion...
+
+anthro_n_rast_us_exclusion
+
+# Partition it up into seaweed zones
+
+anthro_n_saccharina <- crop(anthro_n_rast_us_exclusion, saccharina_extent) 
+anthro_n_gracilaria <- crop(anthro_n_rast_us_exclusion, gracilaria_extent)
+anthro_n_macrocystis <- crop(anthro_n_rast_us_exclusion, macrocystis_extent)
+anthro_n_eucheuma <- crop(anthro_n_rast_us_exclusion, eucheuma_extent)
+
+# Ratio uptake
+uptake_n_saccharina <- (sac_uptake + G_uptake) * avg_cell_km2 / anthro_n_saccharina
+uptake_n_gracilaria <- G_uptake* avg_cell_km2/anthro_n_gracilaria
+uptake_n_macrocystis <- kelp_uptake* avg_cell_km2/anthro_n_macrocystis
+uptake_n_eucheuma <- eucheuma_uptake* avg_cell_km2/anthro_n_eucheuma
+
+uptake_n_saccharina_df <- as.data.frame(uptake_n_saccharina, xy = TRUE) %>% drop_na()
+uptake_n_gracilaria_df <- as.data.frame(uptake_n_gracilaria, xy = TRUE) %>% drop_na()
+uptake_n_macrocystis_df <- as.data.frame(uptake_n_macrocystis, xy = TRUE) %>% drop_na()
+uptake_n_eucheuma_df <- as.data.frame(uptake_n_eucheuma, xy = TRUE) %>% drop_na()
+
+
+total_potential_uptake = nrow(uptake_n_saccharina_df)*sac_uptake*avg_cell_km2 + nrow(uptake_n_gracilaria_df)*avg_cell_km2 * G_uptake + nrow(uptake_n_macrocystis_df)*avg_cell_km2 * kelp_uptake + nrow(uptake_n_eucheuma_df) * eucheuma_uptake*avg_cell_km2
+
+total_potential_uptake
+
+303600/38274283533 * 
+
+# hist(uptake_n_saccharina_df$layer)
+# 
+# # Min saccharina N available = 914.9061
+# 
+# # 18,000 + 18,800 = 36,800
+# 
+# plot(anthro_n_eucheuma)
+# 
+# plot(anthro_n_gracilaria)
+
+.000007
+
+8/1,000,000
+
+```
+
+```{r}
+us_uptake_percentage <- ggplot() +
+  geom_raster(data = uptake_n_saccharina_df, aes(x = x, y = y, fill = layer)) +
+  geom_raster(data = uptake_n_gracilaria_df, aes(x = x, y = y, fill = layer)) +
+  geom_raster(data = uptake_n_macrocystis_df, aes(x = x, y = y, fill = layer)) +
+  geom_raster(data = uptake_n_eucheuma_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Seaweed aquaculture percent N uptake ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_gradient(low = "red", high = "green", name = "(% N uptake)", na.value = "black", breaks = c(seq(0,100, by = 10)), limits = c(0, 100), oob = scales::squish) + 
+  geom_sf(data = saccharina_poly$geometry, fill = NA, color = "goldenrod") +
+  geom_sf(data = eucheuma_poly$geometry, fill = NA, color = "yellow") +
+  geom_sf(data = gracilaria_poly$geometry, fill = NA, color = "chartreuse3") +
+  geom_sf(data = macrocystis_poly$geometry, fill = NA, color = "darkgoldenrod")
+
+us_uptake_percentage
+
+ggsave(plot = us_uptake_percentage, filename = here("figures", "no_dep","us_uptake_percentage.png"))
+```
+```{r}
+anthr_n_hist_uptake <- anthro_n_histogram_us +
+  geom_vline(aes(xintercept = 18800 + 18000* avg_cell_km2), color = "goldenrod") +
+  geom_vline(aes(xintercept = G_uptake*avg_cell_km2), color = "chartreuse3") +
+  geom_vline(aes(xintercept = kelp_uptake*avg_cell_km2), color = "darkgoldenrod") +
+  geom_vline(aes(xintercept = eucheuma_uptake*avg_cell_km2), color = "yellow")
+
+
+ggsave(plot = anthr_n_hist_uptake, filename = here("figures", "no_dep","anthr_n_hist_uptake.png"))
+```
+
+
+
+############### Below this is just scratch work
+
+```{r}
+# Calculate some cell statistics based on the exclusion layer
+# By first summing all the nitrogen/phosphorus in the water
+totalN <- raster(anthro_n_res)
+sumN <- raster::cellStats(totalN, "sum")
+
+totalP <- raster(anthro_p_res)
+sumP <- raster::cellStats(totalP, "sum")
+
+# Then calculating how much of that pollutant lies within suitable aquaculture area
+availableN <- totalN * raster(exclusion_reclass)
+availableP <- totalP * raster(exclusion_reclass)
+
+# First sum the total available N
+sum_avN <- raster::cellStats(availableN, "sum")
+sum_avP <- raster::cellStats(availableP, "sum")
+# Then calculate the percentage available
+pct_av_N <- sum_avN/sumN * 100
+pct_av_P <- sum_avP/sumN * 100
+
+max(totalN)
+max(anthro_n_res)
+
+```
+
+
+# Calculating nutrient uptake per species for a given raster cell:
+
+### First, calculate the average cell size in m:
+```{r}
+# in meters:
+cell_m <- max(cellSize(anthro_n_res))
+
+cell_m <- 11013280
+# 451135604 m2
+
+max(anthro_n_res)
+# 120653424 kg n per year
+maxN <- 120653424
+```
+
+
+
+The max amount a fully cultivated Eucheuma cell could uptake is `r round(G_uptake, 2)` kg N per year. The maximum nitrogen loading to a cell is `r maxN`. So, once fully cultivated, a cell could uptake `r G_uptake/maxN * 100` % of the nitrogen in the most affected raster cell.
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+#################Starting P############
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+```{r}
+# Transformation for plotting:
+anthro_p_rast <- raster(anthro_p_downscale)
+anthro_p_rast_df <- as.data.frame(anthro_p_rast, xy = TRUE) %>% drop_na()
+
+anthro_p_fine_rast <- raster(anthro_P)
+anthro_p_fine_rast_df <- as.data.frame(anthro_p_rast, xy = TRUE) %>% drop_na()
+
+#hist(anthro_p_fine_rast_df$nit_dep_1993)
+
+# 0.08 x 0.08 degree plot
+
+# whole_us_pollution_08 <- 
+#   ggplot() +
+#   geom_raster(data = anthro_p_fine_rast_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+#   geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+#   geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+#   geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+#   theme_void() +
+#   theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+#   labs(title = "Anthropogenic phosphorus in the United States (kg/yr)", x = NULL, y = NULL) +
+#   scale_x_continuous(expand = c(0,0)) +
+#     scale_y_continuous(expand = c(0,0)) +
+#   scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# 0.2 x 0.2 degree plot
+whole_us_pollution_2 <- ggplot() +
+  geom_raster(data = anthro_p_rast_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic P in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+
+# Pacific highlight: 
+
+anthro_p_rast_pacific <- raster::crop(anthro_p_rast, pacific)
+anthro_p_rast_pacific_df <- as.data.frame(anthro_p_rast_pacific, xy = TRUE) %>% drop_na()
+
+
+pacific_anthro_p_pollution <- 
+  ggplot() +
+  geom_raster(data = anthro_p_rast_pacific_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us_pac$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_pac$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_pac$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic P in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Atlantic highlight
+anthro_p_rast_atlantic <- raster::crop(anthro_p_rast, atlantic)
+anthro_p_rast_atlantic_df <- as.data.frame(anthro_p_rast_atlantic, xy = TRUE) %>% drop_na()
+
+atlantic_anthro_p_pollution <- 
+  ggplot() +
+  geom_raster(data = anthro_p_rast_atlantic_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us_atl$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_atl$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_atl$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic P in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# SoCal Bight
+
+socal <- extent(c(-123, -115, 30, 35))
+
+anthro_p_rast_socal <- raster::crop(anthro_p_rast, socal)
+anthro_p_rast_socal_df <- as.data.frame(anthro_p_rast_socal, xy = TRUE) %>% drop_na()
+
+canada_socal <- st_as_sf(ne_countries(country = "Canada", scale = "large")) %>% 
+  st_crop(socal)
+mexico_socal <- st_as_sf(ne_countries(country = "Mexico", scale = "large")) %>% 
+  st_crop(socal)
+us_socal <- st_as_sf(ne_countries(country = "United States of America", scale = "large")) %>% 
+  st_crop(socal)
+
+socal_anthro_p_pollution <- ggplot() +
+  geom_raster(data = anthro_p_rast_socal_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic P in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", trans = "log", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), limits = c(1, 120653423))
+
+# anthro_p_rast_socal_fine <- raster::crop(anthro_p_fine_rast, socal)
+# anthro_p_rast_socal_df_fine <- as.data.frame(anthro_p_rast_socal_fine, xy = TRUE) %>% drop_na()
+# 
+# max(anthro_p_rast_socal_df_fine$plume_1)
+# 
+# ggplot() +
+#   geom_raster(data = anthro_p_rast_socal_df_fine, aes(x = x, y = y, fill = plume_1)) +
+#   geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+#   geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+#   geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+#   theme_void() +
+#   theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+#   labs(title = "Anthropogenic P in the United States (kg/yr)", x = PULL, y = NULL) +
+#   scale_x_continuous(expand = c(0,0)) +
+#     scale_y_continuous(expand = c(0,0)) +
+#   scale_fill_viridis(option = "magma", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), limits = c(1, 11655982))
+
+# Northeast highlight
+
+anthro_p_rast_ne <- raster::crop(anthro_p_rast, saccharina_atlantic)
+anthro_p_rast_ne_df <- as.data.frame(anthro_p_rast_ne, xy = TRUE) %>% drop_na()
+
+northeast_anthro_p_pollution <- ggplot() +
+  geom_raster(data = anthro_p_rast_ne_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us_ne$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_ne$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_ne$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic P in the United States (kg/yr)", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+```
+
+```{r}
+whole_us_pollution_2
+northeast_anthro_p_pollution
+socal_anthro_p_pollution
+atlantic_anthro_p_pollution
+pacific_anthro_p_pollution
+
+ggsave(plot = whole_us_pollution_2, filename = here("figures","no_dep", "whole_us_pollution_2.png"))
+ggsave(plot = northeast_anthro_p_pollution, filename = here("figures","no_dep", "northeast_anthro_p_pollution.png"))
+ggsave(plot = socal_anthro_p_pollution, filename = here("figures", "no_dep", "socal_anthro_p_pollution.png"))
+ggsave(plot = atlantic_anthro_p_pollution, filename = here("figures","no_dep", "atlantic_anthro_p_pollution.png"))
+ggsave(plot = pacific_anthro_p_pollution, filename = here("figures","no_dep", "pacific_anthro_p_pollution.png"))
+```
+# Make some histograms for these data
+
+```{r}
+#whole_us_pollution_histogram <- 
+
+anthro_p_histogram_us <- ggplot(data = anthro_p_rast_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 2100)) +
+  theme_bw() +
+  labs(title = "Histogram of anthropogenic pgen load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency")
+# Pacific
+anthro_p_histogram_pacific <- ggplot(data = anthro_p_rast_pacific_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1100)) +
+  theme_bw() +
+  labs(title = "Histogram of Pacific anthropogenic phosphorus load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency")
+
+# Atlantic
+anthro_p_histogram_atlantic <- ggplot(data = anthro_p_rast_atlantic_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1100)) +
+  theme_bw() +
+  labs(title = "Histogram of Atlantic anthropogenic phosphorus load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency")
+
+# Socal
+anthro_p_histogram_socal <- ggplot(data = anthro_p_rast_socal_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Histogram of Southern California anthropogenic phosphorus \nload (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency")
+
+# Northeast
+anthro_p_histogram_ne <- ggplot(data = anthro_p_rast_ne_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Histogram of NE anthropogenic phosphorus \nload (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency")
+```
+
+
+```{r}
+anthro_p_histogram_us
+anthro_p_histogram_pacific
+anthro_p_histogram_atlantic
+anthro_p_histogram_socal
+anthro_p_histogram_ne
+
+ggsave(plot = anthro_p_histogram_us, filename = here("figures", "no_dep","anthro_p_histogram_us.png"))
+ggsave(plot = anthro_p_histogram_pacific, filename = here("figures", "no_dep","anthro_p_histogram_pacific.png"))
+ggsave(plot = anthro_p_histogram_atlantic, filename = here("figures", "no_dep","socal_anthro_p_pollution.png"))
+ggsave(plot = atlantic_anthro_p_pollution, filename = here("figures", "no_dep","anthro_p_histogram_atlantic.png"))
+ggsave(plot = anthro_p_histogram_socal, filename = here("figures", "no_dep","anthro_p_histogram_socal.png"))
+```
+
+
+
+```{r}
+  
+# Resample it to the BO layer so the cells align completely
+anthro_p_res <- terra::resample(anthro_p_downscale, template, method = "near")
+anthro_p_res <- terra::resample(anthro_p_downscale, template, method = "near")
+# plot(anthro_p_res)
+
+# 
+# # So do it without:
+noriverP <- anthro_p_res/bo_Pkg #max 4829967
+noriverP <- anthro_p_res/bo_Pkg # max 11403262
+
+plot(noriverP)
+# 
+# plot(ratio)
+# plot(ratioP)
+# 
+# terra::writeRaster(ratio, here("analysis_outputs", "anthro_p_ratio.tif"), overwrite = TRUE)
+# terra::writeRaster(ratioP, here("analysis_outputs", "anthro_P_ratio.tif"), overwrite = TRUE)
+
+```
+
+
+```{r}
+# Whole US:
+p_ratio_us_df <- as.data.frame(noriverP, xy = TRUE) %>% drop_na()
+
+p_ratio_us_plot <- 
+  ggplot() +
+  geom_raster(data = p_ratio_us_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural phosphorus ratio ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Pacific
+
+p_ratio_pacific <- raster::crop(noriverP, pacific)
+p_ratio_pacific_df <- as.data.frame(p_ratio_pacific, xy = TRUE) %>% drop_na()
+
+p_ratio_pacific_plot <- ggplot() +
+  geom_raster(data = p_ratio_pacific_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us_pac$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_pac$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_pac$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural phosphorus ratio", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+
+
+# Socal
+
+p_ratio_socal <- raster::crop(noriverP, socal)
+p_ratio_socal_df <- as.data.frame(p_ratio_socal, xy = TRUE) %>% drop_na()
+
+p_ratio_socal_plot <- ggplot() +
+  geom_raster(data = p_ratio_socal_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural phosphorus ratio", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Atlantic
+p_ratio_atl <- raster::crop(noriverP, atlantic)
+p_ratio_atl_df <- as.data.frame(p_ratio_atl, xy = TRUE) %>% drop_na()
+
+p_ratio_atl_plot <- ggplot() +
+  geom_raster(data = p_ratio_atl_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us_atl$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_atl$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_atl$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural phosphorus ratio", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Northeast
+p_ratio_ne <- raster::crop(noriverP, saccharina_atlantic)
+p_ratio_ne_df <- as.data.frame(p_ratio_ne, xy = TRUE) %>% drop_na()
+
+p_ratio_ne_plot <- ggplot() +
+  geom_raster(data = p_ratio_ne_df, aes(x = x, y = y, fill = plume_1)) +
+  geom_sf(data = us_ne$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_ne$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_ne$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Anthropogenic to natural phosphorus ratio", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+```
+
+
+
+# Plot these ratios:
+```{r}
+# plotting
+p_ratio_us_plot
+p_ratio_pacific_plot
+p_ratio_socal_plot
+p_ratio_atl_plot
+p_ratio_ne_plot
+
+
+ggsave(plot = p_ratio_us_plot, filename = here("figures", "no_dep","p_ratio_us_plot.png"))
+ggsave(plot = p_ratio_pacific_plot, filename = here("figures", "no_dep","p_ratio_pacific_plot.png"))
+ggsave(plot = p_ratio_socal_plot, filename = here("figures", "no_dep","p_ratio_socal_plot.png"))
+ggsave(plot = p_ratio_atl_plot, filename = here("figures", "no_dep","p_ratio_atl_plot.png"))
+ggsave(plot = p_ratio_ne_plot, filename = here("figures", "no_dep","p_ratio_ne_plot.png"))
+```
+# Histogram of the ratios:
+
+```{r}
+
+#whole_us_p_ratio_histogram <- 
+p_ratio_us_hist <- ggplot(data = p_ratio_us_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1000)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, whole US",
+       x = "Anthropogenic to natural P ratio", y = "Frequency")
+
+# Pacific
+p_ratio_pac_hist <- ggplot(data = p_ratio_pacific_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 750)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, Pacific",
+       x = "Anthropogenic to natural P ratio", y = "Frequency")
+
+# Atlantic
+p_ratio_atl_hist <- ggplot(data = p_ratio_atl_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 800)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, Atlantic",
+       x = "Anthropogenic to natural P ratio", y = "Frequency")
+
+# Socal
+p_ratio_socal_hist <- ggplot(data = anthro_p_rast_socal_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 250)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, Southern California",
+       x = "Anthropogenic to natural P ratio", y = "Frequency")
+
+# Northeast
+p_ratio_ne_hist <- ggplot(data = anthro_p_rast_ne_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, Northeast",
+       x = "Anthropogenic to natural P ratio", y = "Frequency")
+```
+
+```{r}
+p_ratio_us_hist
+p_ratio_pac_hist
+p_ratio_atl_hist
+p_ratio_socal_hist
+p_ratio_ne_hist
+
+ggsave(plot = p_ratio_us_hist, filename = here("figures", "no_dep","p_ratio_us_hist.png"))
+ggsave(plot = p_ratio_pac_hist, filename = here("figures", "no_dep","p_ratio_pacific_hist.png"))
+ggsave(plot = p_ratio_socal_hist, filename = here("figures", "no_dep","p_ratio_socal_hist.png"))
+ggsave(plot = p_ratio_atl_hist, filename = here("figures", "no_dep","p_ratio_atl_hist.png"))
+ggsave(plot = p_ratio_ne_hist, filename = here("figures", "no_dep","p_ratio_ne_hist.png"))
+```
+
+
+## phosphorus available with our exclusion analysis:
+
+### Add in exclusion:
+```{r}
+# Turn the exclusion layer into a 2 degree grid
+# exclusion <- rast(here("new_data", "exclusion", "us_exclusion.tif"))
+
+# template = rast(anthro_p_rast)
+
+exclusion <- rast(here("new_data", "exclusion", "us_exclusion_nofmp.tif"))
+
+# plot(exclusion)
+# by downscaling to the proper res
+exclusion_downscale <- terra::aggregate(exclusion, fact = expansion, fun = "mean", na.rm = TRUE)
+# Then aligning the cells
+exclusion_res <- terra::resample(exclusion_downscale, template, method = "near") 
+
+m <- c(
+       0.0000001, Inf, 1)
+
+rclmat <- matrix(m, ncol=3, byrow=TRUE)
+
+exclusion_reclass <- exclusion_res %>% 
+  terra::classify(rclmat)
+
+plot(exclusion_reclass)
+# Replace 0 with NA
+exclusion_reclass <- classify(exclusion_reclass, cbind(0, NA))
+plot(exclusion_reclass)
+```
+### Then, repeat with excluded zones: #WTF
+
+```{r}
+anthro_p_rast_us <-raster(anthro_p_downscale)
+
+exclusion_reclass <- raster(exclusion_reclass)
+extent(exclusion_reclass) <- extent(anthro_p_rast_us)
+
+plot(exclusion_reclass)
+
+
+# Multiply then select for each zone:
+
+
+anthro_p_rast_us_exclusion <- anthro_p_rast_us * exclusion_reclass
+anthro_p_rast_ne_exclusion <- crop(anthro_p_rast_us_exclusion, saccharina_atlantic)
+anthro_p_rast_atlantic_exclusion <- crop(anthro_p_rast_us_exclusion, atlantic)
+anthro_p_rast_socal_exclusion <- crop(anthro_p_rast_us_exclusion, socal)
+anthro_p_rast_pacific_exclusion <- crop(anthro_p_rast_us_exclusion, pacific)
+
+# Turn them into data frames
+anthro_p_rast_us_exclusion_df <- as.data.frame(anthro_p_rast_us_exclusion, xy = TRUE) %>% drop_na()
+anthro_p_rast_ne_exclusion_df <- as.data.frame(anthro_p_rast_ne_exclusion, xy = TRUE) %>% drop_na()
+anthro_p_rast_atlantic_exclusion_df <- as.data.frame(anthro_p_rast_atlantic_exclusion, xy = TRUE) %>% drop_na()
+anthro_p_rast_socal_exclusion_df <- as.data.frame(anthro_p_rast_socal_exclusion, xy = TRUE) %>% drop_na()
+anthro_p_rast_pacific_exclusion_df <- as.data.frame(anthro_p_rast_pacific_exclusion, xy = TRUE) %>% drop_na()
+
+# Plot them
+
+#Whole US
+p_exclusion_us <- ggplot() +
+  geom_raster(data = anthro_p_rast_us_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Northeast
+p_exclusion_ne <- ggplot() +
+  geom_raster(data = anthro_p_rast_ne_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_ne$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_ne$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_ne$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Atlantic
+n_exclusion_atl <- ggplot() +
+  geom_raster(data = anthro_p_rast_atlantic_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_atl$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_atl$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_atl$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# Pacific
+n_exclusion_pac <- ggplot() +
+  geom_raster(data = anthro_p_rast_pacific_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_pac$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_pac$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_pac$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+# socal
+n_exclusion_socal <- ggplot() +
+  geom_raster(data = anthro_p_rast_socal_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus in available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 120653423))
+
+```
+
+```{r}
+n_exclusion_us
+n_exclusion_atl
+n_exclusion_pac
+n_exclusion_socal
+n_exclusion_ne
+
+ggsave(plot = n_exclusion_us, filename = here("figures", "no_dep","p_exclusion_us.png"))
+ggsave(plot = n_exclusion_atl, filename = here("figures", "no_dep","p_exclusion_atl.png"))
+ggsave(plot = n_exclusion_pac, filename = here("figures", "no_dep","p_exclusion_pac.png"))
+ggsave(plot = n_exclusion_socal, filename = here("figures", "no_dep","p_exclusion_socal.png"))
+ggsave(plot = n_exclusion_ne, filename = here("figures", "no_dep","p_exclusion_ne.png"))
+```
+
+
+# Add the available phosphorus to the OG phosphorus historgrams
+```{r}
+#whole_us_pollution_histogram <- 
+
+n_exclusion_hist_us <- ggplot()+
+  geom_histogram(data = anthro_p_rast_df, aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 2100)) +
+  theme_bw() +
+  labs(title = "Histogram of anthropogenic phosphorus load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_p_rast_us_exclusion_df, aes(x = layer), fill = "forestgreen", color = "grey80")
+
+# Pacific
+n_exclusion_hist_pac <- ggplot(data = anthro_p_rast_pacific_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1100)) +
+  theme_bw() +
+  labs(title = "Histogram of Pacific anthropogenic phosphorus load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_p_rast_pacific_exclusion_df, aes(x = layer), fill = "forestgreen", color = "grey80")
+
+# Atlantic
+n_exclusion_hist_atlantic <- ggplot(data = anthro_p_rast_atlantic_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1100)) +
+  theme_bw() +
+  labs(title = "Histogram of Atlantic anthropogenic phosphorus load (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_p_rast_atlantic_exclusion_df, aes(x = layer), fill = "forestgreen", color = "grey80")
+
+# Socal
+n_exclusion_hist_socal <- ggplot(data = anthro_p_rast_socal_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Histogram of Southern California anthropogenic phosphorus \nload (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_p_rast_socal_exclusion_df, aes(x = layer), fill = "blue", color = "grey80")
+
+# Northeast
+n_exclusion_hist_ne <- ggplot(data = anthro_p_rast_ne_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Histogram of NE anthropogenic phosphorus \nload (kg) per raster cell for the US EEZ",
+       x = "Anthropogenic phosphorus (kg/year)", y = "Frequency") +
+  geom_histogram(data = anthro_p_rast_ne_exclusion_df, aes(x = layer), fill = "blue", color = "grey80")
+```
+
+```{r}
+n_exclusion_hist_us
+n_exclusion_hist_pac
+n_exclusion_hist_atlantic
+n_exclusion_hist_ne
+n_exclusion_hist_socal
+
+ggsave(plot = n_exclusion_hist_us, filename = here("figures", "no_dep","p_exclusion_hist_us.png"))
+ggsave(plot = n_exclusion_hist_pac, filename = here("figures", "no_dep","p_exclusion_hist_pac.png"))
+ggsave(plot = n_exclusion_hist_atlantic, filename = here("figures", "no_dep","p_exclusion_hist_atlantic.png"))
+ggsave(plot = n_exclusion_hist_ne, filename = here("figures", "no_dep","p_exclusion_hist_ne.png"))
+ggsave(plot = n_exclusion_hist_socal, filename = here("figures", "no_dep","p_exclusion_hist_socal.png"))
+```
+
+
+# Repeat for the ratios:
+
+```{r}
+n_ratio_us <- raster(noriverP)
+n_ratio_us <- resample(n_ratio_us, exclusion_reclass) # gets rid of some origin weirdness...
+
+# Multiply then select for each zone:
+anthro_p_ratio_us_exclusion <- n_ratio_us * exclusion_reclass
+anthro_p_ratio_ne_exclusion <- crop(anthro_p_ratio_us_exclusion, saccharina_atlantic)
+anthro_p_ratio_atlantic_exclusion <- crop(anthro_p_ratio_us_exclusion, atlantic)
+anthro_p_ratio_socal_exclusion <- crop(anthro_p_ratio_us_exclusion, socal)
+anthro_p_ratio_pacific_exclusion <- crop(anthro_p_ratio_us_exclusion, pacific)
+
+# Turn them into data frames
+anthro_p_ratio_us_exclusion_df <- as.data.frame(anthro_p_ratio_us_exclusion, xy = TRUE) %>% drop_na()
+anthro_p_ratio_ne_exclusion_df <- as.data.frame(anthro_p_ratio_ne_exclusion, xy = TRUE) %>% drop_na()
+anthro_p_ratio_atlantic_exclusion_df <- as.data.frame(anthro_p_ratio_atlantic_exclusion, xy = TRUE) %>% drop_na()
+anthro_p_ratio_socal_exclusion_df <- as.data.frame(anthro_p_ratio_socal_exclusion, xy = TRUE) %>% drop_na()
+anthro_p_ratio_pacific_exclusion_df <- as.data.frame(anthro_p_ratio_pacific_exclusion, xy = TRUE) %>% drop_na()
+```
+
+# Plotting 
+
+```{r}
+# Plot them
+
+#Whole US
+n_ratio_exclusion_us <- ggplot() +
+  geom_raster(data = anthro_p_ratio_us_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+# Northeast
+n_ratio_exclusion_ne <- ggplot() +
+  geom_raster(data = anthro_p_ratio_ne_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_ne$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_ne$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_ne$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+# Atlantic
+n_ratio_exclusion_atl <- ggplot() +
+  geom_raster(data = anthro_p_ratio_atlantic_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_atl$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_atl$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_atl$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+# Pacific
+n_ratio_exclusion_pac <- ggplot() +
+  geom_raster(data = anthro_p_ratio_pacific_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_pac$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_pac$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_pac$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+# socal
+n_ratio_exclusion_socal <- ggplot() +
+  geom_raster(data = anthro_p_ratio_socal_exclusion_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = us_socal$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada_socal$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico_socal$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "phosphorus ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  scale_fill_viridis(option = "viridis", name = "(kgP/yr)", na.value = "black", breaks = c(100, 1000, 10000, 1e5, 1000000, 1e7), trans = "log", limits = c(1, 3618883))
+
+```
+
+```{r}
+n_ratio_exclusion_us
+n_ratio_exclusion_ne
+n_ratio_exclusion_pac
+n_ratio_exclusion_socal
+n_ratio_exclusion_atl
+
+ggsave(plot = n_ratio_exclusion_us, filename = here("figures", "no_dep","p_ratio_exclusion_us.png"))
+ggsave(plot = n_ratio_exclusion_ne, filename = here("figures", "no_dep","p_ratio_exclusion_ne.png"))
+ggsave(plot = n_ratio_exclusion_pac, filename = here("figures", "no_dep","p_ratio_exclusion_pac.png"))
+ggsave(plot = n_ratio_exclusion_socal, filename = here("figures", "no_dep","p_ratio_exclusion_socal.png"))
+ggsave(plot = n_ratio_exclusion_atl, filename = here("figures", "no_dep","p_ratio_exclusion_atl.png"))
+```
+
+
+```{r}
+# US
+n_ratio_exclusion_hist_us <- ggplot()+
+  geom_histogram(data = n_ratio_us_df,aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 1000)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, whole US",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_p_ratio_us_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+  
+
+# Pacific
+n_ratio_exclusion_hist_pac <- ggplot(data = n_ratio_pacific_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 750)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, Pacific",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_p_ratio_pacific_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+
+# Atlantic
+n_ratio_exclusion_hist_atl <- ggplot(data = n_ratio_atl_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 800)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, Atlantic",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_p_ratio_atlantic_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+
+# Socal
+n_ratio_exclusion_hist_socal <- ggplot(data = n_ratio_socal_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 250)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, Southern California",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_p_ratio_socal_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+
+# Northeast
+n_ratio_exclusion_hist_ne <- ggplot(data =n_ratio_ne_df)+
+  geom_histogram(aes(x = plume_1), fill = "firebrick", color = "firebrick3", bins = 30) +
+  scale_x_continuous(trans = "log", breaks = c(100, 1000, 10000, 1e5, 1e6, 1e7, 1e8), limits = c(1, 1e7)) +
+  scale_y_continuous(expand = c(0,0), limits = c(0, 300)) +
+  theme_bw() +
+  labs(title = "Ratio of anthropogenic to natural phosphorus, Northeast",
+       x = "Anthropogenic to natural N ratio", y = "Frequency") +
+  geom_histogram(data = anthro_p_ratio_ne_exclusion_df, aes(x = layer), fill = "blue", color = "blue", bins = 30)
+```
+
+```{r}
+n_ratio_exclusion_hist_us
+n_ratio_exclusion_hist_ne
+n_ratio_exclusion_hist_pac
+n_ratio_exclusion_hist_socal
+n_ratio_exclusion_hist_atl
+
+ggsave(plot = n_ratio_exclusion_hist_us, filename = here("figures", "no_dep","p_ratio_exclusion_hist_us.png"))
+ggsave(plot = n_ratio_exclusion_hist_ne, filename = here("figures", "no_dep","p_ratio_exclusion_hist_ne.png"))
+ggsave(plot = n_ratio_exclusion_hist_pac, filename = here("figures", "no_dep","p_ratio_exclusion_hist_pac.png"))
+ggsave(plot = n_ratio_exclusion_hist_socal, filename = here("figures", "no_dep","p_ratio_exclusion_hist_socal.png"))
+ggsave(plot = n_ratio_exclusion_hist_atl, filename = here("figures", "no_dep","p_ratio_exclusion_hist_atl.png"))
+```
+
+### WOOHOO done with the phosphorus loading figures
+
+
+# Seaweed theoretical uptake:
+
+## Let's see where seaweed species can actually grow:
+
+```{r}
+area <- extent(c(-129.235025705, -65.699025705, 23.829413411, 49.093413411))
+
+eucheuma <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Eucheuma") %>% 
+  sf::st_crop(area)
+
+saccharina <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Saccharina") %>% 
+  sf::st_crop(area)
+
+gracilaria <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Gracilaria") %>% 
+  sf::st_crop(area)
+
+macrocystis <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Macrocystis") %>% 
+  sf::st_crop(area)
+```
+
+```{r}
+# seaweed range plot
+
+eucheuma_range <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  geom_sf(data = eucheuma, color = "yellow", lwd = 1) +
+  labs(title = "Eucheuma range ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0))
+
+gracilaria_range <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  geom_sf(data = gracilaria, color = "chartreuse3", lwd = 1) +
+  labs(title = "Gracilaria range ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0))
+
+saccharina_range <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  geom_sf(data = saccharina, color = "goldenrod", lwd = 1) +
+  labs(title = "Saccharina range ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0))
+
+macrocystis_range <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  geom_sf(data = macrocystis, color = "darkgoldenrod", lwd = 1) +
+  labs(title = "Macrocystis range ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0))
+
+eucheuma_range
+gracilaria_range
+saccharina_range
+macrocystis_range
+
+ggsave(plot = eucheuma_range, filename = here("figures", "no_dep","seaweed_range_maps", "eucheuma_range.png"))
+ggsave(plot = gracilaria_range, filename = here("figures", "no_dep","seaweed_range_maps","gracilaria_range.png"))
+ggsave(plot = saccharina_range, filename = here("figures","seaweed_range_maps", "saccharina_range.png"))
+ggsave(plot = macrocystis_range, filename = here("figures","seaweed_range_maps", "macrocystis_range.png"))
+```
+
+# Now that we know the ranges, we can partition our model to include both...
+
+```{r}
+# bounding box coordinates
+
+atlantic <- extent(c(-100, -65.699025705, 23.829413411, 49.093413411))
+pacific <- extent(c(-129.235025705, -100, 23.829413411, 49.093413411))
+
+# Create the polygons:
+
+# Saccharina
+saccharina_poly <- rgeos::bbox2SP(n =  49.1  , s = 40.4, w =-81.3,e = -65.7 ) %>% 
+  st_as_sf()
+
+# Eucheuma
+eucheuma_poly <- rgeos::bbox2SP(n =  40.4  , s = 24, w =-81.3,e = -65.7 ) %>% 
+  st_as_sf()
+
+# Gracilaria
+gracilaria_poly <- rgeos::bbox2SP(n =  35  , s = 24, w =-100, e = -81.3) %>% 
+  st_as_sf()
+
+# Macrocystis
+macrocystis_poly <- rgeos::bbox2SP(n =  49.1  , s = 30, w =-129,e = -115 ) %>% 
+  st_as_sf
+
+```
+
+
+```{r}
+seaaweed_aquaculture_boxes <- ggplot() +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Seaweed aquaculture ranges ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  geom_sf(data = saccharina_poly$geometry, fill = NA, color = "goldenrod") +
+  geom_sf(data = eucheuma_poly$geometry, fill = NA, color = "yellow") +
+  geom_sf(data = gracilaria_poly$geometry, fill = NA, color = "chartreuse3") +
+  geom_sf(data = macrocystis_poly$geometry, fill = NA, color = "darkgoldenrod")
+
+seaaweed_aquaculture_boxes
+
+ggsave(plot = seaaweed_aquaculture_boxes, filename = here("figures", "no_dep","seaweed_range_maps", "seaweed_aquaculture_boxes.png"))
+```
+
+```{r}
+# Create some extents:
+
+# Saccharina & gracilaria
+saccharina_extent <- extent(saccharina_poly)
+
+# Eucheuma
+eucheuma_extent <- extent(eucheuma_poly)
+
+# Gracilaria
+gracilaria_extent <- extent(gracilaria_poly)
+
+# Macrocystis
+macrocystis_extent <- extent(macrocystis_poly)
+```
+
+
+
+
+
+
+# Gracilaria
+```{r}
+# Gracilaria
+# Estimated at 5.8-6.9 t/ha/yr
+# From https://www.sciencedirect.com/science/article/pii/0044848689900264
+# Gyeild <-  6.9 * 100 # tonsSeaweed/ha * 100 ha/1km2 = tons_seaweed/km2
+# Gn_uptake = .039 * Gyeild # = tonsN/km2 
+# Gn_kg = Gn_uptake * 907.185 # kg/km2
+# G_uptake <- Gn_kg
+
+# Long Island Sound calculated a true removal of around 28-94 kg/ha per 90 day season - about half of a full season
+# https://www.sciencedirect.com/science/article/abs/pii/S0044848614002658
+# 94 kg/ha * 100ha/km2 = 9400 kg/km2
+# or about 18,800 kg/km2
+
+G_uptake <- 18800 # kg/km
+
+# Our minimum was 1,101,328 kg/ha, so off by like a huge order of magnitude. Going with the LIS published amounts...
+```
+
+# Eucheuma
+```{r}
+# Eucheuma: 8-12 tons per HA
+# 1000 dry tons per km2 from WorldBank
+#https://documents1.worldbank.org/curated/en/947831469090666344/pdf/107147-WP-REVISED-Seaweed-Aquaculture-Web.pdf
+# Tissue content = 0.017
+# cell_km <- cell_m * .0000001
+# yeild <- cell_km * 1000 # tonsSeaweed/ km
+# n_uptake = .017 * yeild # tonsN/km
+# n_kg = n_uptake * 907.185
+# eucheuma_uptake <- n_kg
+
+
+#1000 tons/km = 10 tons/ha
+
+# eucheuma uptake = G_uptake * eucheuma_tissue_content/gracilaria_tissue_content * eucheuma_yield/gracilaria_yeild
+
+eucheuma_uptake <- G_uptake * 0.017/0.039 * 10/7 # kg/km
+```
+
+# Macrocystis
+```{r}
+# Macrocystis
+    # Yeild is 100 tonnes/ha/yr from Buschmann, 2014 The Status of Kelp Exploitation and Marine Agronomy
+    # https://www.researchgate.net/publication/329602577_Revisiting_the_economic_profitability_of_giant_kelp_Macrocystis_pyrifera_Ochrophyta_cultivation_in_Chile
+    # Myeild <- cell_km * 200 * 100 # tons/ha * 100 ha/1km2 = tons/km2
+    # Mn_uptake = .03 * Myeild # tonsN/km2 (Yeild x tissue content)
+    # Mn_kg = Mn_uptake * 907.185
+
+# Giant kelp has slightly lower tissue content than gracilaria
+# but a much higher yield - 100/7
+
+  # gracilaria uptake * kelp_tissue_content/gracilaria_tissue_content * kelp_yield/gracilaria_yeild
+
+kelp_uptake <- G_uptake * 0.03/0.039 * 100/7 #kg/km
+
+```
+
+# Saccharina
+
+According to the Long Island Sound study, saccharina maximum uptake is around 18,000 kg/km per season
+```{r}
+# For saccharina:
+# 2500 kg/ha/yr * 1ha/0.01km2
+# sac_cell_remove <- 2500 * 1/.01 # = 250,000 # kg/cell/year
+
+
+# https://www.semanticscholar.org/paper/Use-of-sugar-kelp-aquaculture-in-Long-Island-Sound-Kim-Kraemer/01f9ea5b15a171ac2c83dcb8a8745f56705ad02d
+# Long island sound estimates 180 kgP/ha removed from saccharina
+
+# 180 kg/ha * 100ha/km2 = 18,000 kg.km2
+sac_uptake <- 18000
+
+```
+
+
+```{r}
+G_uptake
+sac_uptake
+kelp_uptake
+eucheuma_uptake
+ 
+
+# Calculate the average cell area for multiplication:
+
+avg_cell_area <- area(anthro_p_rast_us_exclusion) %>% 
+  as.data.frame(xy = TRUE) %>% drop_na()
+
+avg_cell_km2 <- mean(avg_cell_area$layer)
+```
+
+# Let's look at kelp in Southern California first:
+
+
+```{r}
+n_remaining_kelp_uptake <- anthro_p_rast_socal_exclusion - (kelp_uptake*avg_cell_km2)
+
+plot(anthro_p_rast_socal_exclusion) # max = 4,289,684
+plot(n_remaining_kelp_uptake) # max = 4,083,091
+```
+
+```{r}
+# Take the US exclusion...
+
+anthro_p_rast_us_exclusion
+
+# Partition it up into seaweed zones
+
+anthro_p_saccharina <- crop(anthro_p_rast_us_exclusion, saccharina_extent) 
+anthro_p_gracilaria <- crop(anthro_p_rast_us_exclusion, gracilaria_extent)
+anthro_p_macrocystis <- crop(anthro_p_rast_us_exclusion, macrocystis_extent)
+anthro_p_eucheuma <- crop(anthro_p_rast_us_exclusion, eucheuma_extent)
+
+# Ratio uptake
+uptake_p_saccharina <- (sac_uptake + G_uptake) * avg_cell_km2 / anthro_p_saccharina
+uptake_p_gracilaria <- G_uptake* avg_cell_km2/anthro_p_gracilaria
+uptake_p_macrocystis <- kelp_uptake* avg_cell_km2/anthro_p_macrocystis
+uptake_p_eucheuma <- eucheuma_uptake* avg_cell_km2/anthro_p_eucheuma
+
+uptake_p_saccharina_df <- as.data.frame(uptake_p_saccharina, xy = TRUE) %>% drop_na()
+uptake_p_gracilaria_df <- as.data.frame(uptake_p_gracilaria, xy = TRUE) %>% drop_na()
+uptake_p_macrocystis_df <- as.data.frame(uptake_p_macrocystis, xy = TRUE) %>% drop_na()
+uptake_p_eucheuma_df <- as.data.frame(uptake_p_eucheuma, xy = TRUE) %>% drop_na()
+
+
+total_potential_uptake = nrow(uptake_p_saccharina_df)*sac_uptake*avg_cell_km2 + nrow(uptake_p_gracilaria_df)*avg_cell_km2 * G_uptake + nrow(uptake_p_macrocystis_df)*avg_cell_km2 * kelp_uptake + nrow(uptake_p_eucheuma_df) * eucheuma_uptake*avg_cell_km2
+
+total_potential_uptake
+
+303600/38274283533 * 
+
+# hist(uptake_p_saccharina_df$layer)
+# 
+# # Min saccharina N available = 914.9061
+# 
+# # 18,000 + 18,800 = 36,800
+# 
+# plot(anthro_p_eucheuma)
+# 
+# plot(anthro_p_gracilaria)
+
+.000007
+
+8/1,000,000
+
+```
+
+```{r}
+us_uptake_percentage <- ggplot() +
+  geom_raster(data = uptake_p_saccharina_df, aes(x = x, y = y, fill = layer)) +
+  geom_raster(data = uptake_p_gracilaria_df, aes(x = x, y = y, fill = layer)) +
+  geom_raster(data = uptake_p_macrocystis_df, aes(x = x, y = y, fill = layer)) +
+  geom_raster(data = uptake_p_eucheuma_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Seaweed aquaculture percent N uptake ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+  scale_y_continuous(expand = c(0,0)) +
+  scale_fill_gradient(low = "red", high = "green", name = "(% N uptake)", na.value = "black", breaks = c(seq(0,100, by = 10)), limits = c(0, 100), oob = scales::squish) + 
+  geom_sf(data = saccharina_poly$geometry, fill = NA, color = "goldenrod") +
+  geom_sf(data = eucheuma_poly$geometry, fill = NA, color = "yellow") +
+  geom_sf(data = gracilaria_poly$geometry, fill = NA, color = "chartreuse3") +
+  geom_sf(data = macrocystis_poly$geometry, fill = NA, color = "darkgoldenrod")
+
+us_uptake_percentage
+
+ggsave(plot = us_uptake_percentage, filename = here("figures", "no_dep","us_uptake_percentage.png"))
+```
+```{r}
+anthr_p_hist_uptake <- anthro_p_histogram_us +
+  geom_vline(aes(xintercept = 18800 + 18000* avg_cell_km2), color = "goldenrod") +
+  geom_vline(aes(xintercept = G_uptake*avg_cell_km2), color = "chartreuse3") +
+  geom_vline(aes(xintercept = kelp_uptake*avg_cell_km2), color = "darkgoldenrod") +
+  geom_vline(aes(xintercept = eucheuma_uptake*avg_cell_km2), color = "yellow")
+
+
+ggsave(plot = anthr_p_hist_uptake, filename = here("figures", "no_dep","anthr_p_hist_uptake.png"))
+```
+
+
+
+############### Below this is just scratch work
+
+```{r}
+# Calculate some cell statistics based on the exclusion layer
+# By first summing all the phosphorus/phosphorus in the water
+totalN <- raster(anthro_p_res)
+sumN <- raster::cellStats(totalN, "sum")
+
+totalP <- raster(anthro_p_res)
+sumP <- raster::cellStats(totalP, "sum")
+
+# Then calculating how much of that pollutant lies within suitable aquaculture area
+availableN <- totalN * raster(exclusion_reclass)
+availableP <- totalP * raster(exclusion_reclass)
+
+# First sum the total available N
+sum_avN <- raster::cellStats(availableN, "sum")
+sum_avP <- raster::cellStats(availableP, "sum")
+# Then calculate the percentage available
+pct_av_N <- sum_avN/sumN * 100
+pct_av_P <- sum_avP/sumN * 100
+
+max(totalN)
+max(anthro_p_res)
+
+```
+
+
+# Calculating nutrient uptake per species for a given raster cell:
+
+### First, calculate the average cell size in m:
+```{r}
+# in meters:
+cell_m <- max(cellSize(anthro_p_res))
+
+cell_m <- 11013280
+# 451135604 m2
+
+max(anthro_p_res)
+# 120653424 kg n per year
+maxN <- 120653424
+```
+
+
+
+The max amount a fully cultivated Eucheuma cell could uptake is `r round(G_uptake, 2)` kg N per year. The maximum phosphorus loading to a cell is `r maxN`. So, once fully cultivated, a cell could uptake `r G_uptake/maxN * 100` % of the phosphorus in the most affected raster cell.

@@ -1,0 +1,371 @@
+---
+title: "nutrient_pollution"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(raster)
+library(tidyverse)
+library(here)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rnaturalearthhires)
+library(rgdal)
+library(lwgeom)
+library(sf)
+library(maptools)
+
+rasterOptions(maxmemory = 1e10, progress = "text")
+```
+
+### This just straight up needs to be redone...
+
+
+
+## What about the Sparrow model?
+
+
+## This transforms the pacific stream reaches that were used in SPARROW into a useful df & proj
+```{r}
+# We need to associate the comid identifiers with actual stream locations.
+reaches_pac <- read_sf(here("data", "SPARROWmodelinp", "PAC_REACHES"), layer = "PAC_REACHES")
+# We need to drop the M dimension of this file...
+reaches_pacXYZ <- st_zm(reaches_pac, what = "ZM")
+# But this is in albers equal area...
+# Let's reproject to wgs84
+proj <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+reaches_proj <- st_transform(reaches_pacXYZ, proj)
+```
+
+### This takes NOAA's published stream reaches, selects only terminal reaches that contact the coastline, and then turns them into points (outflows) on the coastline.
+### Why do I need to use the second reach dataset? Because the first has no indicator of whether a reach is a terminal flowline or not!
+
+##### Stream reaches Downloaded from here:
+This is seamless flattened lower 48 flowlines:
+https://s3.amazonaws.com/edap-nhdplus/NHDPlusV21/Data/NationalData/NHDPlusV21_NationalData_Seamless_Geodatabase_Lower48_07.7z
+
+```{r}
+# Can we just extract terminal streams from the gdb?
+# Let's see whats in this gdb
+ogrListLayers(here("data", "NHDPlusNationalData", "NHDPlusV21_National_Seamless_Flattened_Lower48.gdb"))
+# We want NHDFlowline_Network
+# Read in the NHD flowline network
+flowline <- readOGR(here("data", "NHDPlusNationalData", "NHDPlusV21_National_Seamless_Flattened_Lower48.gdb"), "NHDFlowline_Network")
+#And select only flowlines that have been classified terminal flowlines
+flow_terminal <- flowline %>% 
+  as.data.frame() %>%  
+  filter(TerminalFl == 1)
+# And we can pull just the COMIDs from these.
+flow_comids <- flow_terminal %>%
+  dplyr::select("COMID") %>% 
+  mutate(terminal = TRUE)
+# If we join this to the reaches_proj dataset...
+reaches_terminal <- inner_join(reaches_proj, flow_comids, by = "COMID") %>% 
+  st_as_sf()
+# We get all the terminal reaches used in the SPARROW mode. Some are still land-based.
+#cplot(reaches_terminal)
+```
+
+# This code reads in the ocean reaches:
+```{r}
+reaches_terminal <- read_sf(here("scratch"), layer = "pac_term_reaches")
+
+# In GIS (for speed), I buffered the coastline by 100 m and then selected all the stream reaches that intersected that buffer.
+## Shoreline_selectt is a 100m buffer using the NOAA medium resolution shoreline
+## Ocean reaches is a 1km buffer from the EEZ, which is too coarse
+ocean_reaches_pac <- as.data.frame(read_sf(here("scratch", "ocean_reaches"), layer = "shoreline_selectt"))
+
+# And we can join them to the terminal reaches, keeping only terminal reaches within 100m of the ocean.
+final_reaches <- inner_join(reaches_terminal, ocean_reaches_pac, by = "COMID") %>% 
+  select("COMID", "geometry.x") %>% 
+  st_as_sf()
+# This ignores puget sound but looks good everywhere else
+
+# We can next sample the endpoints for each line:
+# First, turn all the complex lines into straght ones
+reaches_simple <- st_simplify(final_reaches)
+# Find the nearest points to our EEZ: using the st_startpoint function in the lwgeom package
+
+reach_starts <- reaches_simple %>% 
+  mutate(geometry = st_startpoint(reaches_simple)) %>% 
+  as.data.frame() %>% 
+  dplyr::select("COMID", "geometry") %>% 
+  st_as_sf
+
+```
+
+
+```{r}
+
+#### DO I NEED THIS??
+### IDK
+
+# We can recycle the function that snaps points to a polygon here...
+st_snap_points <- function(x, y, namevar, max_dist = 1000){
+  # this evaluates the length of the data
+  if (inherits(x, "sf")) n = nrow(x)
+  if (inherits(x, "sfc")) n = length(x)
+  # this part: 
+  # 1. loops through every piece of data (every point)
+  # 2. snaps a point to the nearest line geometries
+  # 3. calculates the distance from point to line geometries
+  # 4. retains only the shortest distances and generates a point at that intersection
+  out = do.call(c,
+                lapply(seq(n), function(i) {
+                  nrst = st_nearest_points(st_geometry(x)[i], y)
+                  nrst_len = st_length(nrst)
+                  nrst_mn = which.min(nrst_len)
+                  if (as.vector(nrst_len[nrst_mn]) > max_dist) return(st_geometry(x)[i])
+                  return(st_cast(nrst[nrst_mn], "POINT")[2])
+                })
+  )
+  # this part converts the data to a dataframe and adds a named column of your choice
+  out_xy <- st_coordinates(out) %>% as.data.frame()
+  out_xy <- out_xy %>% 
+    mutate({{namevar}} := x[[namevar]]) %>% 
+    st_as_sf(coords=c("X","Y"), crs=st_crs(x), remove=FALSE)
+  
+  return(out_xy)
+}
+
+# Apply the function to snap points to the EEZ:
+reach_snap <- st_snap_points(reach_starts, eez, namevar = "COMID")
+plot(reach_snap)
+```
+
+### Joining the coastline reaches to nutrient data:
+```{r}
+# Read in nutrient data from the SPARROW model:
+sparrow_pac <- read_csv(here("data", "SPARROWmodelinp", "pac_sparrow_model_output_tn.txt"))
+# Select the nitrogen (kg/yr) and the stream reach identifiers (comid)
+sparrow_tn_pac <- sparrow_pac %>% 
+  select("comid", "al_tn")
+# Join these values to the reach outlets
+pac_join <- inner_join(sparrow_tn_pac, reach_starts, by = c("comid" = "COMID"))
+# Turn into an sf object
+pac_joinsf <- st_as_sf(pac_join)
+
+# We can read in our ocean raster:
+ocean <- raster("ocean_mask_landnull.tif")
+# Turn this into a polygon:
+ocean_poly <- rasterToPolygons(ocean)
+o_poly_sf <- st_as_sf(ocean_poly)
+plot(ocean_poly)
+# And try and snap the points to the nearest point on the polygon:
+# Using this function..
+st_snap_points = function(x, y, max_dist = 1000) {
+  if (inherits(x, "sf")) n = nrow(x)
+  if (inherits(x, "sfc")) n = length(x)
+
+  out = do.call(c,
+                lapply(seq(n), function(i) {
+                  nrst = st_nearest_points(st_geometry(x)[i], y)
+                  nrst_len = st_length(nrst)
+                  nrst_mn = which.min(nrst_len)
+                  if (as.vector(nrst_len[nrst_mn]) > max_dist) return(st_geometry(x)[i])
+                  return(st_cast(nrst[nrst_mn], "POINT")[2])
+                })
+  )
+  return(out)
+}
+
+## THIS TAKES FOREVER
+## pac_n_snap <- st_snap_points(pac_joinsf, o_poly_sf)
+
+# i can join the COMID from pac_joinsf to the snapped point geometries:
+pac_n_snap[1]
+snap_df <- data.frame(pac_n_snap) %>% 
+  cbind(pac_joinsf$comid) %>% 
+  st_as_sf() %>% 
+  rename(comid = "pac_joinsf$comid")
+
+# ...Woohoo. I still need to join this back to each
+  
+st_write(pac_n_snap, here("scratch", "pac_river_snap.shp"))
+
+```
+
+
+
+
+####### PLUME MODELING:::
+
+From Warwick et al., 2004:
+ https://doi.org/10.1029/2003GL019114
+ 
+ 
+ Plumea area is related to the area of the watershed that flows into the river as:
+ 
+ $P = cA^\b$
+ 
+ where c is a plume size factor related to discharge (0.5-2 for moderate flows) 
+ 
+ and b is 0.65
+ 
+ c is estimated to be 0.5 by Warrick et al. 2017. for rivers without coastal influence.
+ https://www.sciencedirect.com/science/article/pii/S0079661116300532?via%3Dihub#!
+ 
+ 
+What to do with this?
+
+Calculate plume area for each plume.
+Select adjacent cells until the total plume area is covered
+Then...diffuse total kg across those cells?
+  Scaling 
+
+in sparrow_pac:
+
+* CumAreaKM2 is the cumulative upstream watershed area for each reach.
+
+* al_tn_scg = scrub and grassland
+* _atm is atmospheric disposition ()
+* _urb is urban land
+* _ald is red alder trees
+* _fert is fertilizer
+* _wwtp is wastewater
+* DEL_FRAC is the fraction delivered downstream...
+
+```{r}
+
+### THIS IS ALL FUCKED
+# Read in the snapped data...
+pac_n_snap <- read_sf(here("scratch"), layer = "pac_river_snap")
+# These are terminal reaches
+pac_reaches <- read_sf(here("scratch"), layer= "pac_term_reaches")
+sparrow_pac <- read_csv(here("data", "SPARROWmodelinp", "pac_sparrow_model_output_tn.txt"))
+
+sparrow_final <- sparrow_pac %>% 
+  select("comid", "al_tn", "CumAreaKM2")
+
+which.max(sparrow_pac$CumAreaKM2)
+
+test <- sparrow_pac[249714,]
+# Rejoin to the COMID's:
+
+snap_df <- pac_n_snap %>% 
+  mutate(comid = reach_starts$COMID)
+
+# Then add the total nitrogen to this, also CumAreaKM2
+snap_n_a <- sparrow_pac %>% 
+  select("comid", "al_tn", "CumAreaKM2") %>% 
+  inner_join(snap_df, by = "comid")
+
+
+test_plume_df <- head(snap_n_a, 10) %>% 
+  st_as_sf()
+
+eez <- raster(here("new_data", "ocean_masks", "ocean_mask_landnull.tif"))
+# Run this for the plume model.....
+
+
+# Turn it into sp...
+test_plume_spat <- as_Spatial(test_plume_df)
+
+ocean_polygon <- rasterToPolygons(eez)
+
+crs(ocean_polygon) <-  432
+plot(ocean_polygon)
+
+test_plume_snap <- maptools::snapPointsToLines(points = test_plume_spat, lines = ocean_polygon)
+
+
+
+
+plume_fx(points = test_plume_df,
+         raster = eez,
+         path = here("scratch", "test_plume"))
+
+test_rast <- raster(here("scratch", "test_plume", "1671441.tif"))
+
+plot(test_rast)
+```
+
+```{r}
+plume_fx <- function(points, raster, c = 0.5, b = 0.65, path){
+
+# points = snap_n_a[10,]
+# raster = eez
+# path = here("scratch", "test_plume")  
+  
+    # So there's only one row:
+    for(i in 1:nrow(points)){
+    
+      test_pt <- points[i,]
+      name <- paste("plume_", i, ".tif", sep = "")
+      path2 <- paste(path, points$comid, sep = "/")
+      
+      ### THIS HAPPENS ONCE
+      # Get which cell contains that point
+      cell <- cellFromXY(raster, st_coordinates(test_pt$geometry))
+      # Duplicate the OG raster
+      newraster <- raster
+      # Set point = 1
+      newraster[cell] <- 1
+      
+      # Calculate plume area: in KM2
+        c <- 0.5
+        b <- 0.65
+        p_area <- c*(test_pt$CumAreaKM2^b) *1000
+      
+      ### THIS REPEATS
+       tot_area <- 0
+       n_runs <- 1
+      repeat {
+        # get cell names for cells that are 1
+        newcell <- Which(newraster>=1, cells = TRUE)
+        # Find adjacent cells
+        adj <- adjacent(newraster, newcell, directions = 4, pairs = FALSE)
+        # Turn them into ones
+        newraster[adj] <- 1
+        # Create a new "newraster" with new ones:
+        newraster <- newraster+raster
+        tot_area <- sum(as.vector(area(newraster)*newraster), na.rm = TRUE)
+        n_runs <- n_runs+1
+        # Repeat function until the area is bigger than the plume:
+        if(tot_area >= p_area) break}
+     
+    ###
+    ### PLUMING
+    ###
+       
+     # Then I actually need to plume these into the ocean.
+       
+     # Get the effluent as a value
+     effluent <- test_pt$al_tn
+     # Get the proportion of effluent included in each expansion
+     prop_eff <- effluent/n_runs
+     
+     # Create a plume raster:
+     p_raster <- raster
+     final <- raster
+     final[cell] <- prop_eff
+      # Set OG point = effluent
+     p_raster[cell] <- 1
+     # Then, loop through again:
+     p_runs <- 1
+     repeat{
+        # get cell names for cells that are 1
+        p_cell <- Which(final>=1, cells = TRUE)
+        # Find adjacent cells
+        adj <- adjacent(p_raster, p_cell, directions = 4, pairs = FALSE)
+        # Turn them into ones
+        p_raster[adj] <- 1
+        # Set OG cells to NA's
+        p_raster[p_cell] <- NA
+        # Get cell numbers for new cells
+        e_cell <- Which(p_raster>=1, cells = TRUE)
+        # Add effluent proportionally over the new cells
+        final[e_cell] <- prop_eff/length(e_cell)
+        final <- final + raster
+        
+        # Conditional for loop ending
+        p_runs <- p_runs+1
+        # Repeat function until the area is bigger than the plume:
+        if(p_runs >= n_runs) break}
+     
+     writeRaster(final, path2, format = "GTiff", overwrite = TRUE)
+    }
+  }
+```

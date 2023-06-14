@@ -1,0 +1,85 @@
+---
+title: "streamflow_regression"
+author: "Gabriel De La Rosa"
+date: "7/7/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(here)
+library(sf)
+```
+
+## This creates a regression equation that relates watershed size to a stream's size based on the SPARROW modeling
+
+wbm_meanq is mean streamflow in cubic feet per second
+
+```{r}
+c <- 0.5
+b <- 0.65
+
+files <- list.files(here("new_data", "GIS_output", "nitrogen"), pattern = "snapjoin", full.names = TRUE)
+
+midwest <- st_read(here("new_data", "GIS_output", "nitrogen"), layer = "midwest_snapjoin_tn") %>% 
+  dplyr::select("CumAreaKm2", "wbm_meanq") %>% 
+  mutate(p_area = c*(CumAreaKm2^b))
+
+northeast <- st_read(here("new_data", "GIS_output", "nitrogen"), layer = "northeast_snapjoin") %>% 
+  dplyr::select("CumAreaKm2", "FLOWcfs") %>% 
+  mutate(p_area = c*(CumAreaKm2^b))
+
+southeast <- st_read(here("new_data", "GIS_output", "nitrogen"), layer = "southeast_snapjoin") %>% 
+  dplyr::select("CumAreaKm2", "wbm_meanq") %>% 
+  mutate(p_area = c*(CumAreaKm2^b))
+
+southwest <- st_read(here("new_data", "GIS_output", "nitrogen"), layer = "southwest_snapjoin") %>% 
+  dplyr::select("CumAreaKm2", "wbm_meanq") %>% 
+  mutate(p_area = c*(CumAreaKm2^b))
+
+
+## No flows for the pacific???
+# pacific <- st_read(here("new_data", "GIS_output", "nitrogen"), layer = "pac_snapjoin") %>% 
+#   select("CumAreaKM2", "FLOWcfs") %>% 
+#   mutate(p_area = c*(CumAreaKm2^b)*1000)
+
+# Define column names
+
+names <- c("CumAreaKm2", "FLOWcfs", "geometry", "plume_area")
+
+colnames(midwest) <- names
+colnames(northeast) <- names
+colnames(southeast) <- names
+colnames(southwest) <- names
+
+whole_outflows <- rbind(midwest, northeast, southeast, southwest)
+  
+  
+ggplot(data = whole_outflows, aes(x = FLOWcfs, y = plume_area)) +
+  geom_point()
+
+plume_lm <- lm(plume_area ~ FLOWcfs, data = whole_outflows)
+
+summary(plume_lm)
+
+```
+
+The plume regression model:
+
+$area = 14.5240 * FLOWcfs + 747.8210$
+
+predicted = 
+```{r}
+sample <- data.frame(FLOWcfs = seq(1, 400000, by = 1)) %>% 
+  mutate(plume_area = .0145240 * FLOWcfs +7.4778210)
+
+plot(plume_lm)
+
+ggplot() +
+  geom_line(data = sample, aes(x = FLOWcfs, y = plume_area)) +
+  geom_point(data = whole_outflows, aes(x = FLOWcfs, y = plume_area))
+
+```
+

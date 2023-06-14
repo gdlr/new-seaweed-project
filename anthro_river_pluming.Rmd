@@ -1,0 +1,550 @@
+---
+title: "anthro_river_processing"
+author: "Gabriel De La Rosa"
+date: "7/16/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(sf)
+library(raster)
+library(tidyverse)
+library(here)
+library(terra)
+
+rasterOptions(maxmemory = 1e10, progress = "text", timer = TRUE, memfrac = .7)
+```
+
+# This script plumes outfall nitrogen and phosphorus into the ocean across the whole us
+
+Load in ocean: 
+```{r}
+ocean <- raster(here("new_data", "GIS_output", "EEZ_reclass.tif"))
+```
+
+### Anthropogenic Nitrogen
+
+```{r}
+# Points we want to plume:
+midwest <- read_sf(here("new_data", "GIS_output", "nitrogen"), layer = "midwest_snapjoin_tn")%>%
+  select("CumAreaKm2", "geometry",
+         "al_tn",
+          "al_tn_wwtp", # Wastewater
+          "al_tn_fert", # Fertilizer
+          "al_tn_man", # Manure
+          "al_tn_atm", # Deposition
+          "al_tn_urb") %>% # Urban
+  mutate(anthro_n = al_tn_wwtp +
+           al_tn_fert +
+           al_tn_man +
+           al_tn_atm +
+           al_tn_urb)
+
+test <- sum(midwest$al_tn) - sum(midwest$anthro_n)
+```
+
+```{r}
+# Points we want to plume:
+northeast <- read_sf(here("new_data", "GIS_output", "nitrogen"), layer = "northeast_snapjoin") %>%
+  select("CumAreaKm2", "geometry",
+         "tn",
+         "tn_poin", # Point Sources
+         "tn_sept", # Septic
+         "tn_fert", # Fertilizer
+         "tn_manu", # Manure
+         "tn_atmo", # Deposition
+         "tn_urb") %>% # Urban
+  mutate(anthro_n = 
+           tn_poin +
+           tn_sept +
+           tn_fert +
+           tn_manu +
+           tn_atmo +
+           tn_urb)
+
+test <- sum(northeast$tn) - sum(northeast$anthro_n)
+# Also has negative values
+hist(northeast$tn-northeast$anthro_n)
+```
+
+```{r}
+# Points we want to plume:
+pacific <- read_sf(here("new_data", "GIS_output"), layer = "pac_snapjoin2") %>% 
+  select("CumAreaKM2", "geometry",
+         "al_tn",
+         "al_tn_wwtp", # wastewater
+         "al_tn_fer", #Fertilizer and manure
+         "al_tn_atm", # Deposition
+         "al_tn_urb") %>% # Urban
+  mutate(anthro_n = 
+           al_tn_wwtp +
+           al_tn_fer +
+           al_tn_atm +
+           al_tn_urb) %>%  
+  mutate (CumAreaKm2 = CumAreaKM2)
+
+test <- sum(pacific$al_tn) - sum(pacific$anthro_n)
+hist(pacific$al_tn - pacific$anthro_n)
+```
+
+```{r}
+# Points we want to plume:
+southeast <- read_sf(here("new_data", "GIS_output", "nitrogen"), layer = "southeast_snapjoin") %>%
+  select("CumAreaKm2", "geometry",
+         "al_tn",
+         "al_tn_wwtp", # wastewater
+         "al_tn_fert", #Fertilizer
+         "al_tn_man", # Manure
+         "al_tn_atm", # Deposition
+         "al_tn_urb") %>% # Urban
+  mutate(anthro_n = al_tn_wwtp +
+           al_tn_fert +
+           al_tn_man +
+           al_tn_atm +
+           al_tn_urb)
+
+test <- sum(southeast$al_tn) - sum(southeast$anthro_n)
+
+### This has negative values...whoops. Can't do anything about it...
+hist(southeast$al_tn - southeast$anthro_n)
+```
+
+```{r}
+# Points we want to plume:
+southwest <- read_sf(here("new_data", "GIS_output", "nitrogen"), layer = "southwest_snapjoin") %>%
+  select("CumAreaKm2", "geometry",
+         "al_tn",
+         "al_tn_wwtp", #Wastewater
+         "al_tn_fert", # Fertilizer
+         "al_tn_man", #Manure
+         "al_tn_atm", # Deposition
+         "al_tn_dev") %>% #Developed Land
+  mutate(anthro_n = al_tn_wwtp + #
+           al_tn_fert + #
+           al_tn_man + #
+           al_tn_atm + #
+           al_tn_dev) # Developed Land
+
+test <- sum(southwest$al_tn) - sum(southwest$anthro_n)
+### This has negative values...whoops. Can't do anything about it...
+hist(southwest$al_tn - southwest$anthro_n)
+```
+
+```{r, anthro model}
+plume_fxAnthro <- function(points, raster, c = 0.5, b = 0.65, path){
+  
+  # points = test_points
+  # raster = ocean
+  # c = 0.5
+  # b = 0.65
+  
+    # Error Checking:
+  if(isLonLat(crs(points)) == FALSE) stop("check CRS, function only works for lon/lat. EPSG 4326 works.")
+  if(isLonLat(crs(raster)) == FALSE) stop("check CRS, function only works for lon/lat. EPSG 4326 works.")
+  
+    # So there's only one row:
+    for(i in 1:nrow(points)){
+    
+      test_pt <- points[i,]
+      name <- paste("plume_", i, ".tif", sep = "")
+      path2 <- paste(path, name, sep = "/")
+      
+      ### THIS HAPPENS ONCE
+      # Get which cell contains that point
+      cell <- cellFromXY(raster, st_coordinates(test_pt$geometry))
+      # Duplicate the OG raster
+      newraster <- raster
+      # Set point = 1
+      newraster[cell] <- 1
+      
+      # Calculate plume area: in KM2
+        p_area <- c*(test_pt$CumAreaKm2^b)
+      
+      ### THIS REPEATS
+       tot_area <- 0
+       n_runs <- 1
+      repeat {
+        # get cell names for cells that are 1
+        newcell <- Which(newraster>=1, cells = TRUE)
+        # Find adjacent cells
+        adj <- adjacent(newraster, newcell, directions = 4, pairs = FALSE)
+        # Turn them into ones
+        newraster[adj] <- 1
+        # Create a new "newraster" with new ones:
+        newraster <- newraster+raster
+        tot_area <- sum(as.vector(area(newraster)*newraster), na.rm = TRUE)
+        n_runs <- n_runs+1
+        # Repeat function until the area is bigger than the plume:
+        if(tot_area >= p_area) break
+        if(n_runs == 1000) break}
+     
+    ###
+    ### PLUMING
+    ###
+       
+     # Then I actually need to plume these into the ocean.
+       
+     # Get the effluent as a value
+     effluent <- test_pt$anthro_n
+     # Get the proportion of effluent included in each expansion
+     prop_eff <- effluent/n_runs
+     
+     # Create a plume raster:
+     p_raster <- raster
+     final <- raster
+     final[cell] <- prop_eff
+      # Set OG point = effluent
+     p_raster[cell] <- 1
+     # Then, loop through again:
+     p_runs <- 1
+     repeat{
+        # get cell names for cells that are 1
+        p_cell <- Which(final>=1, cells = TRUE)
+        # Find adjacent cells
+        adj <- adjacent(p_raster, p_cell, directions = 4, pairs = FALSE)
+        # Turn them into ones
+        p_raster[adj] <- 1
+        # Set OG cells to NA's
+        p_raster[p_cell] <- NA
+        # Get cell numbers for new cells
+        e_cell <- Which(p_raster>=1, cells = TRUE)
+        # Add effluent proportionally over the new cells
+        final[e_cell] <- prop_eff/length(e_cell)
+        final <- final + raster
+        
+        # Conditional for loop ending
+        p_runs <- p_runs+1
+        # Repeat function until the area is bigger than the plume:
+        if(p_runs >= n_runs) break
+        if(p_runs == 1000) break}
+     
+     writeRaster(final, path2, format = "GTiff", overwrite = TRUE)
+    }
+  }
+```
+
+```{r}
+mw_path <- here("plume_outputs", "nitrogen", "midwest_anthroN")
+ne_path <- here("plume_outputs", "nitrogen", "northeast_anthroN")
+pac_path <- here("plume_outputs", "nitrogen", "pacific_anthroN")
+se_path <- here("plume_outputs", "nitrogen", "southeast_anthroN")
+sw_path <- here("plume_outputs", "nitrogen", "southwest_anthroN")
+```
+
+```{r}
+plume_fxAnthro(midwest, ocean, path = mw_path)
+plume_fxAnthro(northeast, ocean, path = ne_path)
+plume_fxAnthro(pacific, ocean, path = pac_path)
+plume_fxAnthro(southeast, ocean, path = se_path)
+plume_fxAnthro(southwest, ocean, path = sw_path)
+```
+
+
+```{r}
+### Summing the rasters:
+
+library(terra)
+N_files <- list.files(here("plume_outputs", "outfalls", "outfall_n"), full.names = TRUE)
+
+sum_fx <- function(input_files, output){
+  # Add first two rasters
+  first <- rast(input_files[1])
+  second <- rast(input_files[2])
+  result <- first+second
+  # Add the remaining
+  for(i in 3:length(input_files)){
+    temp <- rast(input_files[i])
+    result <- result + temp
+  }
+  writeRaster(result, output)
+}
+
+sum_fx(N_files, output = here("plume_outputs", "outfalls", "outfall_n.tif"))
+```
+
+
+```{r}
+mw_files <- list.files(mw_path, full.names = TRUE)
+ne_files <- list.files(ne_path, full.names = TRUE)
+pac_files <- list.files(pac_path, full.names = TRUE)
+se_files <- list.files(se_path, full.names = TRUE)
+sw_files <- list.files(sw_path, full.names = TRUE)
+```
+
+```{r}
+# Sum each file
+sum_fx(mw_files, output = here("plume_outputs", "nitrogen", "mw_anthroN.tif"))
+sum_fx(ne_files, output = here("plume_outputs", "nitrogen", "ne_anthroN.tif"))
+sum_fx(pac_files, output = here("plume_outputs", "nitrogen", "pac_anthroN.tif"))
+sum_fx(se_files, output = here("plume_outputs", "nitrogen", "se_anthroN.tif"))
+sum_fx(sw_files, output = here("plume_outputs", "nitrogen", "sw_anthroN.tif"))
+
+# Sum all files:
+anthro_files <- list.files(here("plume_outputs", "nitrogen"), pattern = ".tif", full.names = TRUE)
+
+sum_fx(anthro_files, here("plume_outputs", "nitrogen", "anthro_riverN.tif"))
+
+test <- rast(here("plume_outputs", "nitrogen", "anthro_riverN.tif"))
+```
+
+### Anthropogenic Phosphorous
+
+```{r}
+# Points we want to plume:
+midwestP <- read_sf(here("new_data", "GIS_output", "phosphorous"), layer = "midwest_snapjoinP") %>%
+  select("CumAreaKm2", "geometry",
+         "al_tp",
+         "al_tp_wwtp", # wastewater
+         "al_tp_fert", # fertilizer
+         "al_tp_man", #manure
+         "al_tp_urb"
+         ) %>% 
+  mutate(anthro_p = 
+           al_tp_wwtp +
+           al_tp_fert +
+           al_tp_man +
+           al_tp_urb)
+
+sum(midwestP$al_tp) - sum(midwestP$anthro_p)
+```
+
+```{r}
+# Points we want to plume:
+northeastP <- read_sf(here("new_data", "GIS_output", "phosphorous"), layer = "northeast_snapjoinP") %>%
+  select("CumAreaKm2", "geometry",
+         "tp",
+         "tp_poin", # Point Sources
+         "tp_fert", # Fertilizer
+         "tp_manu", # Manure
+         "tp_urb") %>% # Urban
+  mutate(anthro_p = 
+           tp_poin +
+           tp_fert +
+           tp_manu +
+           tp_urb)
+```
+
+```{r}
+# Points we want to plume:
+pacificP <- read_sf(here("new_data", "GIS_output", "phosphorous"), layer = "pac_snapjoinP") %>% 
+  select("CumAreaKM2", "geometry",
+         "al_tp_urb", # urban land
+         "al_tp_graz", #Fertilizer and manure applied to pasture and rangeland
+         "al_tp_fer", # Fertilizer applied to cropland
+         "al_tp_wwtp") %>%  # wastewater
+  mutate(anthro_p = al_tp_urb +
+           al_tp_graz +
+           al_tp_fer +
+           al_tp_wwtp) %>%  
+  mutate (CumAreaKm2 = CumAreaKM2)
+```
+
+```{r}
+# Points we want to plume:
+southeastP <- read_sf(here("new_data", "GIS_output", "phosphorous"), layer = "southeast_snapjoinP") %>%
+  select("CumAreaKm2", "geometry",
+         "al_tp_wwtp", # wastewater
+         "al_tp_fert", #Fertilizer
+         "al_tp_man", # Manure  
+         "al_tp_mini", # Mining facility discharge
+         "al_tp_urb", # Urban land
+         "al_tp_mine" #From open mines
+         ) %>% 
+  mutate(anthro_p = al_tp_wwtp +
+           al_tp_fert +
+           al_tp_man +
+           al_tp_mini +
+           al_tp_urb +
+           al_tp_mine)
+```
+
+```{r}
+# Points we want to plume:
+southwestP <- read_sf(here("new_data", "GIS_output", "phosphorous"), layer = "southwest_snapjoinP") %>%
+  select("CumAreaKm2", "geometry",
+         "al_tp_wwtp", #Wastewater #
+         "al_tp_fert", # Fertilizer
+         "al_tp_man", #Manure
+         "al_tp_dev") %>% #Developed Land
+  mutate(anthro_p = al_tp_wwtp + #
+           al_tp_fert + #
+           al_tp_man + #
+           al_tp_dev) # Developed Land
+```
+
+```{r, anthro model}
+plume_fxAnthroP <- function(points, raster, c = 0.5, b = 0.65, path){
+  
+  # points = test_points
+  # raster = ocean
+  # c = 0.5
+  # b = 0.65
+  
+    # Error Checking:
+  if(isLonLat(crs(points)) == FALSE) stop("check CRS, function only works for lon/lat. EPSG 4326 works.")
+  if(isLonLat(crs(raster)) == FALSE) stop("check CRS, function only works for lon/lat. EPSG 4326 works.")
+  
+    # So there's only one row:
+    for(i in 1:nrow(points)){
+    
+      test_pt <- points[i,]
+      name <- paste("plume_", i, ".tif", sep = "")
+      path2 <- paste(path, name, sep = "/")
+      
+      ### THIS HAPPENS ONCE
+      # Get which cell contains that point
+      cell <- cellFromXY(raster, st_coordinates(test_pt$geometry))
+      # Duplicate the OG raster
+      newraster <- raster
+      # Set point = 1
+      newraster[cell] <- 1
+      
+      # Calculate plume area: in KM2
+        p_area <- c*(test_pt$CumAreaKm2^b)
+      
+      ### THIS REPEATS
+       tot_area <- 0
+       n_runs <- 1
+      repeat {
+        # get cell names for cells that are 1
+        newcell <- Which(newraster>=1, cells = TRUE)
+        # Find adjacent cells
+        adj <- adjacent(newraster, newcell, directions = 4, pairs = FALSE)
+        # Turn them into ones
+        newraster[adj] <- 1
+        # Create a new "newraster" with new ones:
+        newraster <- newraster+raster
+        tot_area <- sum(as.vector(area(newraster)*newraster), na.rm = TRUE)
+        n_runs <- n_runs+1
+        # Repeat function until the area is bigger than the plume:
+        if(tot_area >= p_area) break
+        if(n_runs == 1000) break}
+     
+    ###
+    ### PLUMING
+    ###
+       
+     # Then I actually need to plume these into the ocean.
+       
+     # Get the effluent as a value
+     effluent <- test_pt$anthro_p
+     # Get the proportion of effluent included in each expansion
+     prop_eff <- effluent/n_runs
+     
+     # Create a plume raster:
+     p_raster <- raster
+     final <- raster
+     final[cell] <- prop_eff
+      # Set OG point = effluent
+     p_raster[cell] <- 1
+     # Then, loop through again:
+     p_runs <- 1
+     repeat{
+        # get cell names for cells that are 1
+        p_cell <- Which(final>=1, cells = TRUE)
+        # Find adjacent cells
+        adj <- adjacent(p_raster, p_cell, directions = 4, pairs = FALSE)
+        # Turn them into ones
+        p_raster[adj] <- 1
+        # Set OG cells to NA's
+        p_raster[p_cell] <- NA
+        # Get cell numbers for new cells
+        e_cell <- Which(p_raster>=1, cells = TRUE)
+        # Add effluent proportionally over the new cells
+        final[e_cell] <- prop_eff/length(e_cell)
+        final <- final + raster
+        
+        # Conditional for loop ending
+        p_runs <- p_runs+1
+        # Repeat function until the area is bigger than the plume:
+        if(p_runs >= n_runs) break
+        if(p_runs == 1000) break}
+     
+     writeRaster(final, path2, format = "GTiff", overwrite = TRUE)
+    }
+  }
+```
+
+```{r}
+mw_pathP <- here("plume_outputs", "phosphorous", "midwest_anthroP")
+ne_pathP <- here("plume_outputs", "phosphorous", "northeast_anthroP")
+pac_pathP <- here("plume_outputs", "phosphorous", "pacific_anthroP")
+se_pathP <- here("plume_outputs", "phosphorous", "southeast_anthroP")
+sw_pathP <- here("plume_outputs", "phosphorous", "southwest_anthroP")
+```
+
+```{r}
+plume_fxAnthroP(midwestP, ocean, path = mw_pathP)
+plume_fxAnthroP(northeastP, ocean, path = ne_pathP)
+plume_fxAnthroP(pacificP, ocean, path = pac_pathP)
+plume_fxAnthroP(southeastP, ocean, path = se_pathP)
+plume_fxAnthroP(southwestP, ocean, path = sw_pathP)
+```
+
+
+```{r}
+### Summing the rasters:
+
+library(terra)
+N_files <- list.files(here("plume_outputs", "outfalls", "outfall_n"), full.names = TRUE)
+
+sum_fx <- function(input_files, output){
+  # Add first two rasters
+  first <- rast(input_files[1])
+  second <- rast(input_files[2])
+  result <- first+second
+  # Add the remaining
+  for(i in 3:length(input_files)){
+    temp <- rast(input_files[i])
+    result <- result + temp
+  }
+  writeRaster(result, output)
+}
+
+sum_fx(N_files, output = here("plume_outputs", "outfalls", "outfall_n.tif"))
+```
+
+
+```{r}
+# Create paths for saving
+# Nitrogen
+mw_files <- list.files(mw_path, full.names = TRUE)
+ne_files <- list.files(ne_path, full.names = TRUE)
+pac_files <- list.files(pac_path, full.names = TRUE)
+se_files <- list.files(se_path, full.names = TRUE)
+sw_files <- list.files(sw_path, full.names = TRUE)
+
+# Phosphorus
+mw_filesP <- list.files(mw_pathP, full.names = TRUE)
+ne_filesP <- list.files(ne_pathP, full.names = TRUE)
+pac_filesP <- list.files(pac_pathP, full.names = TRUE)
+se_filesP <- list.files(se_pathP, full.names = TRUE)
+sw_filesP <- list.files(sw_pathP, full.names = TRUE)
+```
+
+```{r}
+# Sum each file
+# Nitrogen
+sum_fx(mw_files, output = here("plume_outputs", "nitrogen", "mw_anthroN.tif"))
+sum_fx(ne_files, output = here("plume_outputs", "nitrogen", "ne_anthroN.tif"))
+sum_fx(pac_files, output = here("plume_outputs", "nitrogen", "pac_anthroN.tif"))
+sum_fx(se_files, output = here("plume_outputs", "nitrogen", "se_anthroN.tif"))
+sum_fx(sw_files, output = here("plume_outputs", "nitrogen", "sw_anthroN.tif"))
+
+# Phosphorus
+sum_fx(mw_filesP, output = here("plume_outputs", "phosphorous", "mw_anthroP.tif"))
+sum_fx(ne_filesP, output = here("plume_outputs", "phosphorous", "ne_anthroP.tif"))
+sum_fx(pac_filesP, output = here("plume_outputs", "phosphorous", "pac_anthroP.tif"))
+sum_fx(se_filesP, output = here("plume_outputs", "phosphorous", "se_anthroP.tif"))
+sum_fx(sw_filesP, output = here("plume_outputs", "phosphorous", "sw_anthroP.tif"))
+
+
+# Sum all files:
+anthro_files <- list.files(here("plume_outputs", "nitrogen"), pattern = ".tif", full.names = TRUE)
+sum_fx(anthro_files, here("plume_outputs", "nitrogen", "anthro_riverN.tif"))
+
+anthro_filesP <- list.files(here("plume_outputs", "phosphorous"), pattern = ".tif", full.names = TRUE)
+sum_fx(anthro_files, here("plume_outputs", "phosphorous", "anthro_riverP.tif"))
+```

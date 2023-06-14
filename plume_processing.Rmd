@@ -1,0 +1,192 @@
+---
+title: "us_main_hotspots"
+output: html_document
+---
+
+
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+library(tidyverse)
+library(raster)
+library(sf)
+library(here)
+library(readxl)
+library(fasterize)
+library(rnaturalearth)
+library(rnaturalearthdata)
+library(rnaturalearthhires)
+library(rgeos)
+library(gstat)
+library(maptools)
+library(lwgeom)
+
+rasterOptions(maxmemory = 1e10)
+```
+
+### Set Projections and base rasters:
+```{r}
+# This is a WGS84 standard projection
+proj <- "+proj=longlat +ellps=WGS84 +datum=WGS84 +no_defs"
+# This is a 0.2 degree resolution raster for the whole globe...
+x <- raster(xmn=-180, xmx=180, ymn=-90, ymx=90, res=0.2, crs= proj)
+```
+
+
+```{r}
+# This is a function to crop and mask a raster to the US EEZ.
+mask_fx <- function(object, shp = us_eez){
+  cropped <- raster::crop(object, shp)
+  raster <- raster::rasterize(shp, cropped, getCover = TRUE)
+  raster[raster == 0] <- NA
+  mask <- raster::mask(cropped, raster)
+  return(mask)
+}
+```
+
+
+### Create Area of Interest: US Mainland EEZ
+
+``` {r}
+if(!file.exists(here("cropped_rasters", "us_eez.shp"))){
+  # Read in eez data. This is already in the proper projection.
+  eez <- read_sf(here("data", "World_EEZ_v11_20191118"), layer = "eez_v11")
+  
+  # Filter it down
+  us_eez <- eez %>% 
+    filter(SOVEREIGN1 == "United States") %>% 
+    filter(TERRITORY1 == "United States") %>% 
+    filter(MRGID == "8456") %>% 
+    dplyr::select(TERRITORY1)
+  
+  # Save just the US...
+  sf::write_sf(us_eez, here("cropped_rasters", "us_eez.shp"))
+}
+  
+#plot(eez)
+
+# We can read in our processed files here to save time later:
+us_eez <- read_sf(here("cropped_rasters"), layer = "us_eez")
+# Convert this to an sp df...do I need this?
+us_sp <- as(us_eez, 'Spatial')
+```
+
+US basemap and state lines:
+```{r}
+# Make a US basemap:
+if(!file.exists(here("cropped_rasters", "US_mainland.shp"))){
+  # Read in country data
+  US <- ne_countries(type = "countries", country = "united states of america", scale = 50)
+  # Convert it to an sf object
+  us_sf <- st_as_sf(US)
+  # Crop to the EEZ bounding box (returns only mainland)
+  US_crop <- st_crop(us_sf, us_eez)
+  # Save it for later use
+  write_sf(US_crop, here("cropped_rasters", "US_mainland.shp"))
+}
+US_crop <- read_sf(here("cropped_rasters", "US_mainland.shp"))
+# State Lines
+if(!file.exists(here("cropped_rasters", "US_states.shp"))){
+  # Read in country data
+  US_state <- ne_states(country = "united states of america")
+  # Convert it to an sf object
+  us_state_sf <- st_as_sf(US_state)
+  # Crop to the EEZ bounding box (returns only mainland)
+  US_state_crop <- st_crop(us_state_sf, us_eez)
+  # Save it for later use
+  write_sf(US_state_crop, here("cropped_rasters", "US_states.shp"))
+}
+```
+
+
+## Outfall data:
+This data is the total estimated yearly input of either nitrogen or phosphorous from a point source.
+This is in mercator projection.
+ttl_p__ is the layer name for total pounds of nutrient, for the whole year
+
+```{r}
+if(!file.exists(here("cropped_rasters", "outfall_nitrogen.tif"))){
+  # Read in nitrogen and phosphorous outfall data:
+  outfall_n <- st_read(here("data", "outfall_data"), layer = "outfall_nitrogen") %>% 
+    dplyr::select(ttl_p__)
+  outfall_p <- st_read(here("data", "outfall_data"), layer = "outfall_phosphorous") %>% 
+    dplyr::select(ttl_p__)
+  # Reproject these data to WGS84:
+  out_n_reproj <- st_transform(outfall_n, proj)
+  out_p_reproj <- st_transform(outfall_p, proj)
+  # Find which section intersects the US EEZ
+  out_n_int <- st_intersection(out_n_reproj, us_eez)
+  
+  out_n_int <- out_n_int %>% 
+    rename(effluent = lb_yr_n) %>% 
+    mutate(basin_id = seq(1, 22, by = 1)) #%>% 
+    #dplyr::select(!TERRITORY1)
+  
+  # This ends up being a super limited dataset. I'll use this for now but THIS ISN'T WHAT I WANT.
+  write_sf(out_n_int, here("outfall_nitro.shp"))
+  outfall_nitro <- st_read(here(), layer = "outfall_nitro")
+
+  
+##### This works much better
+  
+st_snap_points <- function(x, y, namevar, max_dist = 1000){
+  
+  # this evaluates the length of the data
+  if (inherits(x, "sf")) n = nrow(x)
+  if (inherits(x, "sfc")) n = length(x)
+  
+  # this part: 
+  # 1. loops through every piece of data (every point)
+  # 2. snaps a point to the nearest line geometries
+  # 3. calculates the distance from point to line geometries
+  # 4. retains only the shortest distances and generates a point at that intersection
+  out = do.call(c,
+                lapply(seq(n), function(i) {
+                  nrst = st_nearest_points(st_geometry(x)[i], y)
+                  nrst_len = st_length(nrst)
+                  nrst_mn = which.min(nrst_len)
+                  if (as.vector(nrst_len[nrst_mn]) > max_dist) return(st_geometry(x)[i])
+                  return(st_cast(nrst[nrst_mn], "POINT")[2])
+                })
+  )
+  # this part converts the data to a dataframe and adds a named column of your choice
+  out_xy <- st_coordinates(out) %>% as.data.frame()
+  out_xy <- out_xy %>% 
+    mutate({{namevar}} := x[[namevar]]) %>% 
+    st_as_sf(coords=c("X","Y"), crs=st_crs(x), remove=FALSE)
+  
+  return(out_xy)
+}
+
+  # Snap the points from the reprojected outfall data to the EEZ polygon
+  outfall_snap_full <- st_snap_points(out_n_reproj, us_eez, "basin_id", max_dist = 10000)
+  plot(outfall_snap_full)
+
+  ## Create an ocean mask...
+  # First, a base global raster with 0.008 res
+  z <- raster(xmn=-180, xmx=180, ymn=-90, ymx=90, res=0.008, crs= proj)
+  # Crop to our AOI
+  z_crop <- mask_fx(z)
+  # Then mask it to the EEZ
+  ocean_mask <- rasterize(us_eez, z)
+  # Write it...
+  writeRaster(z_crop, here("ocean_wide.tif"))
+  
+  
+  plot(out_n_crop)
+  
+  # Turn them into rasters:
+  out_n_raster <- rasterize(out_n_reproj, x, fun = sum)
+  out_p_raster <- rasterize(out_p_reproj, x, fun = sum)
+  # Crop and mask them to the US EEZ
+  out_n_mask <- mask_fx(out_n_raster)
+  out_p_mask <- mask_fx(out_p_raster)
+  # Save the cropped rasters:
+  writeRaster(out_n_mask, here("cropped_rasters", "outfall_nitrogen.tif"), overwrite = TRUE)
+  writeRaster(out_p_mask, here("cropped_rasters", "outfall_phosphorous.tif"), overwrite = TRUE)
+}
+
+plot(out_n_mask)
+
+```
+

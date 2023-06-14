@@ -1,0 +1,733 @@
+---
+title: "prelim_analysis"
+author: "Gabriel De La Rosa"
+date: "7/13/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = FALSE, message = FALSE, warning = FALSE)
+
+library(tidyverse)
+library(raster)
+library(sf)
+library(terra)
+library(gstat)
+library(tmap)
+library(here)
+library(RColorBrewer)
+library(viridis)
+```
+
+# US Ocean Pollution hotspots
+
+
+This document shows our preliminary analysis that estimates nitrogen and phosphorous loading to US waters.
+
+We include 3 main sources for nutrient loading:
+
+- River loading (N and P)
+- Sewage outfalls (N and P)
+- Atmospheric Deposition (N)
+
+## Methods
+
+### River Plumes
+
+River plumes are estimated from [SPARROW](https://www.usgs.gov/mission-
+s/water-resources/science/sparrow-modeling-estimating-nutrient-sediment-and-dissolved?qt-science_center_objects=0#qt-science_center_objects) models, which estimate nutrient flows in stream reaches for the entire US. We parse anthropogenic nutrients for each stream reach that flows into the ocean, then plume those nutrients into the ocean.
+
+River plume extent is estimated using the equation from [Warrick & Farnsworth, 2017](9https://www.sciencedirect.com/science/article/abs/pii/S0079661116300532?via%3Dihub#!):
+
+$P = c*A^\beta)$
+
+where p is the size of the plume, c is a plume size factor related to discharge, A is the upstream watershed 
+and $\beta$ is constant scaling factor. We use c = 0.5 and $\beta$ = 0.65, which are the most commonly found ratios according to Warrick and Farnsworth. 
+
+Plume size for each river plume is calculated based on the upstream watershed 
+. Effluent is plumed into the ocean starting at the spatial location of each rivermouth. Plumes are expanded iteratively using a four-neighbor rule until the total 
+of plumed cells exceeds the predicted plume size in the above 
+. Only cells within the EEZ are included in plume expansion, i.e. cells outside the ocean never contain any of the plume. 
+
+Once the spatial extent of a plume is determined, pollutant mass per raster cell is calculated by first dividing the total mass of the pollutant by the number of expansions needed to achieve the calculated plume size. The total mass of pollutant is distributed equally over each expansion, to simulate increasing dilution as the distance from the point source increases. 
+
+### Outfalls
+
+Outfall spatial extents are complex and hard to generalize. For our purposes, we recycle the plume relationship calculated for rivers and apply them to outfall plumes. Outfalls have an initial velocity and are subject to more complicated oceanographic conditions than river plumes, however, as a general overview, our methods roughly estimate plume location and extent. 
+
+First, because outfalls do not have a watershed size, we first predicted plume 
+based on the flow rate (CFS) of each river. To do this, we used linear regression using R’s lm() function. The results are as follows…
+
+Coefficients:
+             Estimate Std. Error t value Pr(>|t|)    
+(Intercept) 7.4778210  0.9152438    8.17 4.28e-16 ***
+FLOWcfs     0.0145240  0.0001006  144.31  < 2e-16 ***
+---
+Signif. codes:  0 ‘***’ 0.001 ‘**’ 0.01 ‘*’ 0.05 ‘.’ 0.1 ‘ ’ 1
+
+Residual standard error: 53.48 on 3419 degrees of freedom
+Multiple R-squared:  0.859,	Adjusted R-squared:  0.8589 
+F-statistic: 2.083e+04 on 1 and 3419 DF,  p-value: < 2.2e-16
+ 
+
+Giving us a relationship of:
+
+Plume 
+= .0145240 * FLOWcfs + 7.478210
+
+We then apply the same plume model as for river nutrients, where the plume 
+is calculated, plumes are expanded via a 4-neighbor rule until the 
+of the plume exceeds the calculated plume 
+, then the pollutant is distributed to each cell by dividing the same amount of pollutant over all the new cells contained in each expansion. 
+
+### Deposition
+
+Deposition loading is estimated using data from [NOAA](https://daac.ornl.gov/cgi-bin/dsviewer.pl?ds_id=830), where the 1993 dataset seems to be the industry standard.
+
+```{r}
+# river nutrients
+# In kg/yr
+  anthro_riverN <- rast(here("plume_outputs", "nitrogen", "anthro_riverN.tif"))
+  anthro_riverP <- rast(here("plume_outputs", "phosphorous", "anthro_riverP.tif"))
+
+# outfall nutrients
+  # in kg/yr
+  # outfall_N <- rast(here("plume_outputs", "outfalls", "outfall_n.tif"))
+  out_full_N <- rast(here("plume_outputs", "outfalls", "full_n.tif"))
+  out_full_P <- rast(here("plume_outputs", "outfalls", "full_p.tif"))
+
+# Deposition
+  # in mgN/m2/yr
+  deposition <- rast(here("new_data", "from_nut_hotspots", "nit_dep_1993.tif"))
+  # Resample to .008x.008 degrees
+  dep_res <- terra::resample(deposition, anthro_riverN, method = "near")
+  # Compute cell size in m
+  a_008 <- terra::cellSize(anthro_riverN, unit = "m")
+  #plot(a_008)
+  
+  # Convert units:
+  dep_kg <- dep_res * a_008 * (1/1000000)
+  
+ # hist(dep_kg)
+  
+# plot(dep_kg)
+  
+# All together in kg/year, summing outfalls  and rivers
+  
+  anthro_N <- dep_kg + anthro_riverN + out_full_N
+  anthro_P <- anthro_riverP + out_full_P
+  
+writeRaster(anthro_N, filename = "total_anthro_nitrogen.tif")
+
+
+anthro_n_df <- as.data.frame(anthro_N, xy = TRUE) %>% drop_na()
+outfall_n_df <- as.data.frame(out_full_N, xy = TRUE) %>% drop_na()
+
+# Plots for Kristen/Christina
+
+anthro_n_plot <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "black") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "black") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "black") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  geom_raster(data = anthro_n_df, aes(x = x, y = y, fill = nit_dep_1993)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", trans = "log")
+
+ggsave(plot = anthro_n_plot, filename = "anthro_N_0.08.pdf", height = 10)
+
+outfall_n_plot <- ggplot() +
+  geom_sf(data = us$geometry, fill = "grey30", color = "grey30") +
+  geom_sf(data = canada$geometry, fill = "grey20", color = "grey20") +
+  geom_sf(data = mexico$geometry, fill = "grey20", color = "grey20") +
+  theme_void() +
+  theme(panel.background = element_rect(fill = '#CBDADE', colour = '#CBDADE')) +
+  labs(title = "Nitrogen ratio of available marine space ", x = NULL, y = NULL) +
+  scale_x_continuous(expand = c(0,0)) +
+    scale_y_continuous(expand = c(0,0)) +
+  geom_raster(data = outfall_n_df, aes(x = x, y = y, fill = plume_1)) +
+  scale_fill_viridis(option = "viridis", name = "(kgN/yr)", na.value = "black", trans = "log")
+
+ggsave(plot = outfall_n_plot, filename = "outfall_N_0.08.pdf", height = 10)
+
+
+
+  
+  # plot(anthro_N)
+  # plot(anthro_P)
+```
+
+
+```{r}
+# Load in BO nitrogen:
+bo_nit <- raster(here("new_data", "from_nut_hotspots", "bo_nit_2dg.tif"))
+bo_phos <- raster(here("new_data", "from_nut_hotspots", "bo_phos_2dg.tif"))
+
+# Interpolate to the coasts:
+inter <- function(file){
+    r <- file             # Load in the raster
+    # grid <- raster::projectExtent(r, res = 0.2)
+    xy <- data.frame(xyFromCell(r, 1:ncell(r))) #create a df of the grid
+    v = getValues(r) # and a list of the values..
+    tmpdf <- cbind(xy, v)%>%filter(!is.na(v)) # Bind them together
+    mg <- gstat(id = "v", formula = v~1, locations = ~x+y, data=tmpdf,
+              nmax=7, set=list(idp = 2)) # Create a model (power function = 2)
+    z <- interpolate(r, mg, progress='text')
+}
+
+bo_interN <- inter(bo_nit) %>% 
+  rast()
+bo_interP <- inter(bo_phos) %>% 
+  rast()
+
+# Convert the concentration to kg/cell:
+# Original is in micromols/L
+
+##       1 umol/l * 62.0049 g/mol N * 1 mol/1e9 umol = gN/l * 1000 L/1m3 * 1kg/1000g
+
+n_conv <- 62.0049 * 1/1e9 * 1/1000 * 1000/1
+p_conv <- 94.9714 * 1/1e9 * 1/1000 * 1000/1
+
+# Convert the whole raster to kg/m3
+bo_N_kgm <- bo_interN * n_conv
+bo_P_kgm <- bo_interP * p_conv
+
+# Then multiply by the cell size to get just kg per cell:
+bo_Nkg <- bo_N_kgm * cellSize(bo_N_kgm)
+bo_Pkg <- bo_P_kgm * cellSize(bo_P_kgm)
+```
+
+```{r}
+# Create a natural nitrogen river plume layer:
+# Load in the total river nitrogen:
+riverN <- rast(here("plume_outputs", "us_tn_river.tif"))
+riverP <- rast(here("plume_outputs", "us_tp_river.tif"))
+
+nat_riverN <- riverN - anthro_riverN
+nat_riverP <- riverP - anthro_riverP
+
+# Reclassify so NA's don't give 
+# Calculate expansion size
+expansion <- .2/.008
+# Create template 0.2 degree raster so we can keep coastal values
+template <- rast(crs = crs(bo_nit), res = res(bo_nit), extent = ext(bo_nit), vals = 0)
+
+nat_riverN_downscale <- terra::aggregate(nat_riverN, fact = expansion, fun = "mean", na.rm = TRUE)
+nat_riverP_downscale <- terra::aggregate(nat_riverP, fact = expansion, fun = "mean", na.rm = TRUE)
+# Then aligning the cells
+nat_riverN_res <- terra::resample(nat_riverN_downscale, template, method = "near")
+nat_riverP_res <- terra::resample(nat_riverP_downscale, template, method = "near")
+
+# Now we can add the kg introduced by rivers to the BO plume layer in kg:
+naturalN <- bo_Nkg + nat_riverN_res
+naturalP <- bo_Pkg + nat_riverP_res
+
+# plot(riverP)
+# 
+# plot(anthro_riverP)
+
+plot(anthro_N)
+```
+
+```{r}
+# Aggregate the anthro n layer to 0.2 degree cells, summing values
+anthro_n_downscale <- terra::aggregate(anthro_N, fact = expansion, fun = "sum", na.rm = TRUE)
+anthro_p_downscale <- terra::aggregate(anthro_P, fact = expansion, fun = "sum", na.rm = TRUE)
+
+# Resample it to the BO layer so the cells align completely
+anthro_n_res <- terra::resample(anthro_n_downscale, template, method = "near")
+anthro_p_res <- terra::resample(anthro_p_downscale, template, method = "near")
+# plot(anthro_n_res)
+
+# This is in kg/kg ### MY natural river nutrient layer is all messed up
+ratio <- anthro_n_res/naturalN
+ratioP <- anthro_p_res/naturalP
+
+# So do it without:
+rato_noriverN <- anthro_n_res/bo_Nkg
+ratio_noriverP <- anthro_p_res/bo_Pkg
+
+# plot(ratio)
+# plot(ratioP)
+
+terra::writeRaster(ratio, here("analysis_outputs", "anthro_N_ratio.tif"), overwrite = TRUE)
+terra::writeRaster(ratioP, here("analysis_outputs", "anthro_P_ratio.tif"), overwrite = TRUE)
+```
+
+# Results:
+
+To determine where anthropogenic nutrients are most likely to drive ecosystem change, we calculate the ratio of pollutant (N or P) input per year to the total mass of natural nutrients in surface water. High anthropogenic nutrient ratios are more likely to cause eutrophication, and be good targets for seaweed aquaculture as a nutrient remediation strategy.
+
+Results are calculated on a 0.2 degree grid.
+
+### Nitrogen ratio
+```{r}
+## US shapefile (for plotting)
+us_shp <- st_read(here("new_data", "us_shapefile", "US_mainland.shp"))
+
+tmap_mode("view")
+tm_shape(ratio_noriverP) +
+  tm_raster(style = "jenks", n = 12, title = "Anthropogenic nitrogen to natural nitrogen ratio (kg/kg)",
+            palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+            legend.hist = TRUE) +
+  tm_shape(us_shp) +
+  tm_polygons(col = "white")
+```
+
+### Phosphorus ratio
+```{r}
+tm_shape(ratio_noriverP) +
+  tm_raster(style = "jenks", n = 12, title = "Anthro phosphorus to natural phosphorus ratio (kg/kg)",
+            palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+            legend.hist = TRUE) +
+  tm_shape(us_shp) +
+  tm_polygons(col = "white")
+```
+
+# Nutrients in marine space available to aquaculture
+
+While the nutrient ratios highlight where targeted aquaculture for assimilation may be most effective, we also wanted to look and see if there is available marine space around nutrient pollution hotspots for seaweed aquaculture projects. To do this, we performed a simple exclusion analysis for the entire US. We considered marine space that contained any of the following to be unavailable to seaweed aquaculture:
+
+- Shipping lanes
+- MPA's **
+- Submarine Cables
+- Undersea Pipelines
+- Military restricted 
+s
+- Oil and gas platforms or wells
+- Depth (below 10m or above 100m)
+
+We have not yet considered biological suitability for any seaweeds. 
+
+```{r}
+# Turn the exclusion layer into a 2 degree grid
+exclusion <- rast(here("new_data", "exclusion", "us_exclusion.tif"))
+
+# plot(exclusion)
+# by downscaling to the proper res
+exclusion_downscale <- terra::aggregate(exclusion, fact = expansion, fun = "mean", na.rm = TRUE)
+# Then aligning the cells
+exclusion_res <- terra::resample(exclusion_downscale, template, method = "near") 
+
+m <- c(-Inf, 0, 0,
+       0.0000001, Inf, 1)
+
+rclmat <- matrix(m, ncol=3, byrow=TRUE)
+
+exclusion_reclass <- exclusion_res %>% 
+  terra::classify(rclmat)
+
+# plot(exclusion_reclass)
+```
+
+
+
+```{r}
+# Calculate some cell statistics based on the exclusion layer
+# By first summing all the nitrogen/phosphorus in the water
+totalN <- raster(anthro_n_res)
+sumN <- raster::cellStats(totalN, "sum")
+
+totalP <- raster(anthro_p_res)
+sumP <- raster::cellStats(totalP, "sum")
+
+# Then calculating how much of that pollutant lies within suitable aquaculture 
+
+availableN <- totalN * raster(exclusion_reclass)
+availableP <- totalP * raster(exclusion_reclass)
+
+# First sum the total available N
+sum_avN <- raster::cellStats(availableN, "sum")
+sum_avP <- raster::cellStats(availableP, "sum")
+# Then calculate the percentage available
+pct_av_N <- sum_avN/sumN * 100
+pct_av_P <- sum_avP/sumN * 100
+```
+### Results including the full MPA layer from NOAA:
+
+According to a quick calculation, `r round(pct_av_N, 2)`% of anthropogenic nitrogen inputs fall within available marine space, and `r round(pct_av_P, 2)`% anthropogenic phosphorus exists in available marine space.
+
+```{r}
+# Let's plot this:
+# tm_shape(availableN) +
+#   tm_raster(style = "jenks", n = 12, title = "Nitrogen within available space (kg/yr)",
+#             palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+#             legend.hist = TRUE) +
+#   tm_shape(us_shp) +
+#   tm_polygons(col = "white")
+# 
+# 
+# tm_shape(availableP) +
+#     tm_raster(style = "jenks", n = 12, title = "Phosphorus within available space (kg/yr)",
+#             palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+#             legend.hist = TRUE) +
+#   tm_shape(us_shp) +
+#   tm_polygons(col = "white")
+
+```
+
+### Results with limited MPA layer:
+
+Our MPA layer contains several large zones classified as "Non-MPA Programmatic Species/Habitat/Fisheries Management Plan", and includes 
+s like the Pelagic Sargassum Habitat Restricted 
+, which is just a no-take zone for Sargassum. We're double checking that all of these zones still allow aquaculture, so we also performed our exclusion analysis without the Non-MPA zones:
+
+```{r}
+exclusion_nofmp <- rast(here("new_data", "exclusion", "us_exclusion_nofmp.tif"))
+
+# plot(exclusion)
+# by downscaling to the proper res
+ex_nofmp_downscale <- terra::aggregate(exclusion_nofmp, fact = expansion, fun = "mean", na.rm = TRUE)
+# Then aligning the cells
+ex_nofmp_res <- terra::resample(ex_nofmp_downscale, template, method = "near") 
+
+m <- c(-Inf, 0, 0,
+       0.0000001, Inf, 1)
+
+rclmat <- matrix(m, ncol=3, byrow=TRUE)
+
+ex_nofmp_reclass <- ex_nofmp_res %>% 
+  terra::classify(rclmat)
+```
+
+
+```{r}
+
+# Calculate some cell statistics based on the exclusion layer
+# By first summing all the nitrogen/phosphorus in the water
+totalN <- raster(anthro_n_res)
+sumN <- raster::cellStats(totalN, "sum")
+
+totalP <- raster(anthro_p_res)
+sumP <- raster::cellStats(totalP, "sum")
+
+# Then calculating how much of that pollutant lies within suitable aquaculture 
+# THIS IS IN KG???
+av_N_nfmp<- totalN * raster(ex_nofmp_reclass)
+av_P_nfmp <- totalP * raster(ex_nofmp_reclass)
+
+
+# First sum the total available N
+sum_avN_nfmp <- raster::cellStats(av_N_nfmp, "sum")
+sum_avP_nfmp <- raster::cellStats(av_P_nfmp, "sum")
+# Then calculate the percentage available
+pct_av_N_nfmp <- sum_avN_nfmp/sumN * 100
+pct_av_P_nfmp <- sum_avP_nfmp/sumN * 100
+```
+
+According to a quick calculation, only `r round(pct_av_N_nfmp, 2)`% of anthropogenic nitrogen inputs fall within available marine space, and only `r round(pct_av_P_nfmp, 2)`% phosphorus exists in available marine space, if we exclude Non-MPA Programmatic Managment zones.
+
+```{r}
+
+# tmap_mode("plot")
+# # Let's plot this:
+# nit_available <- tm_shape(av_N_nfmp) +
+#   tm_raster(style = "jenks", n = 12, title = "Nitrogen available for remediation (kg/yr)",
+#             palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+#             legend.hist = FALSE) +
+#   tm_shape(us_shp) +
+#   tm_polygons(col = "white") +
+#   tm_layout(legend.position = c("center", "top"))
+# 
+# tmap_save(nit_available, filename = "nitrogen_hotspots.png")
+# 
+# 
+# phos_available <- tm_shape(av_P_nfmp) +
+#     tm_raster(style = "jenks", n = 12, title = "Phosphorus available for remediation (kg/yr)",
+#             palette = colorRampPalette( c("lightblue","yellow", "red"))(12),
+#             legend.hist = FALSE) +
+#   tm_shape(us_shp) +
+#   tm_polygons(col = "white") +
+#   tm_layout(legend.position = c("center", "top"))
+# 
+# tmap_save(phos_available, filename = "phosphorus_hotspots.png")
+ 
+```
+
+
+## Calculating rough nitrogen uptake potential for species:
+
+- Saccharina latissima can remove ~2500 kg/ha/yr N from https://link.springer.com/article/10.1007%2Fs10811-014-0519-8
+- Gracilaria gracilis can remove ~1.15 tons/ha/year N from Anderson and Levitt, 1999 (https://www.sciencedirect.com/science/article/pii/S0022098101003872)
+- Giant kelp? 
+    yeild is 200 tonnes/ha/yr (Buschmann 2014)
+    tissue content is 0.03 N (Ilan Somer)
+    so...200*0.03 = 6 tons N/ha/yr
+    
+
+To estimate the potential nutrient uptake of seaweed aquaculture in the US, we estimate total nutrient uptake of three different seaweed species (sacharina latissima, gracilaria gracilis, macrocystis pyrifera).
+
+# Calculating uptake for giant kelp:
+```{r}
+# Giant Kelp:
+
+# 6 tonsN/ha/yr * 907.185kg/ton = kg/ha/yr
+6 * 907185
+# 5443110 kg/ha/yr * 100ha/1km2 = kg/km2/yr
+kelp_uptake_kgkm2 <- 5443110 * 100
+
+kelp_uptake_per_cell <- raster(kelp_uptake_kgkm2 * cellSize(anthro_n_res))
+  
+```
+
+
+Using yield estimates combined with tissue nitrogen content estimates for each target species, we estimate the potential uptake of a single 0.2x0.2 raster cell planted completely with each target species. Then, we compare the potential nutrient remediation of each raster cell to the total nitrogen pollution in each cell, resulting in the percentage of nutrient pollution that each species can mitigate in each cell. 
+
+The resulting maps are below:
+
+![Nutrient uptake from Saccharina Latissima as a percentage of anthropogenic nitrogen in each raster cell](percent_N_uptake_SLatissima.png)
+![Nutrient uptake from Gracilaria gracilis as a percentage of anthropogenic nitrogen in each raster cell](percent_N_uptake_Gracilaria.png)
+![Nutrient uptake from Macrocystis as a percentage of anthropogenic nitrogen in each raster cell](percent_N_uptake_macrcystis.png)
+
+Initial conclusions for these maps are that while seaweeds can play a significant role in nutrient uptake in some 
+s, seaweed aquaculture is not a complete solution to highly polluted local 
+s, such as the Mississipi River plume. However, a side benefit of offshore seaweed aquaculture is significant potential to mitigate nitrogen deposition to open ocean environments. 
+
+
+```{r}
+# First, calculate the cell size:
+
+# in meters
+cell_m <- cellSize(anthro_n_res)
+# then in km
+cell_km <- cell_m * (1/1000000)
+
+plot(cell_km)
+```
+
+
+```{r}
+
+# This calculates the kg/km2 uptake for each species (nitrogen)
+
+# Eucheuma: 8-12 tons per HA
+# 1000 dry tons per km2 from WorldBank
+#https://documents1.worldbank.org/curated/en/947831469090666344/pdf/107147-WP-REVISED-Seaweed-Aquaculture-Web.pdf
+
+yeild <- cell_km * 1000  # tonsSeaweed/ km
+n_uptake = .017 * yeild # tonsN/km
+n_kg = n_uptake * 907.185 # kg/km2
+eucheuma_uptake <- n_kg
+
+# Gracilaria
+# Estimated at 5.8-6.9 t/ha/yr
+# From https://www.sciencedirect.com/science/article/pii/0044848689900264
+Gyeild <- cell_km * 6.9 * 100 # tonsSeaweed/ha * 100 ha/1km2
+Gn_uptake = .039 * Gyeild # tonsN/km2
+Gn_kg = Gn_uptake * 907.185 # kg/km2
+G_uptake <- Gn_kg
+# Macrocystis
+# Yeild is 100 tonnes/ha/yr from Buschmann, 2014 The Status of Kelp Exploitation and Marine Agronomy
+# https://www.researchgate.net/publication/329602577_Revisiting_the_economic_profitability_of_giant_kelp_Macrocystis_pyrifera_Ochrophyta_cultivation_in_Chile
+Myeild <- cell_km * 200 * 100 # tons/ha * 100 ha/1km2 = tons/km2
+Mn_uptake = .03 * Myeild # tonsN/km2 (Yeild x tissue content)
+Mn_kg = Mn_uptake * 907.185 # kg/km2/yr
+
+plot(Mn_kg)
+
+```
+
+```{r}
+
+
+whole_extent <- extent(c(-129.235025705, -65.699025705, 23.829413411, 49.093413411))
+
+atlantic <- extent(c(-100, -65.699025705, 23.829413411, 49.093413411))
+pacific <- extent(c(-129.235025705, -100, 23.829413411, 49.093413411))
+
+plot(pacific)
+
+eucheuma <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Eucheuma") %>% 
+  sf::st_crop()
+
+saccharina_pacific <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Saccharina") %>% 
+  sf::st_crop(pacific)
+
+saccharina_atlantic <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Saccharina") %>% 
+  sf::st_crop(atlantic)
+
+gracilaria <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Gracilaria") %>% 
+  sf::st_crop(
+    
+  )
+
+macrocystis <- read_sf(here("new_data", "distribution-shapefiles"), layer = "Macrocystis") %>% 
+  sf::st_crop(
+    
+  )
+
+```
+
+```{r}
+# bounding box coordinates
+
+macro_bbox <- st_bbox(macrocystis)
+
+grac_bbox <- st_bbox(gracilaria)
+
+eucheuma_bbox <- st_bbox(eucheuma)
+
+saccharina_bbox <- st_bbox(saccharina_atlantic)
+
+```
+
+
+```{r}
+# Pollution in Saccharina's location (Northeast)
+
+# Saccharina can remove 2500 kg/ha/yr of nitrogen
+
+# For saccharina:
+# 2500 kgN/ha/yr * 100ha/1 km2
+sac_kg_remove <- 2500 * 100/1 # = 250,000 # kg/km2/year
+
+#                 kg/km2/yr uptake *  km2/cell
+
+sac_cell_remove <-  sac_kg_remove * raster(cell_km) # kg/km2/yr * km2/cell = kg/cell/yr
+sac_min_removal <- 81857375
+
+av_n_nfmp_crop <- crop(av_N_nfmp, saccharina_bbox)
+
+# This is the amount per cell saccharina can remove divided by the available nitrogen in that cell
+
+pct_removedN <- sac_cell_remove/sac_N_available * 100
+
+tm_shape(pct_removedN) +
+  tm_raster(style = "fixed", n = 10, title = "% N uptake from sac",
+  palette = colorRampPalette(c("darkred","yellow", "lightgreen"))(10),
+  breaks = c(0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, Inf),
+  legend.hist = FALSE) +
+  tm_shape(us_shp) +
+  tm_polygons(col = "white") +
+  tm_layout(legend.position = c("center", "top"))
+  # tmap_save(macro_pct_rem, "percent_N_uptake_macrcystis.png")
+sac_N_pct_crop
+
+sac_N_pct_crop <- raster::crop(pct_removedN, saccharina_bbox)
+sac_N_pct_crop_df <- as.data.frame(sac_N_pct_crop, xy = TRUE) %>% drop_na()
+
+
+sac_N_available <- raster::crop(av_N_nfmp, saccharina_bbox)
+sac_N_available_df <- as.data.frame(sac_N_available, xy = TRUE) %>% drop_na()
+sac_us <- st_crop(us_shp, saccharina_bbox)
+
+# plot(sac_N_available)
+# plot(us_shp, add = TRUE, col = "grey80")
+
+ggplot() +
+  geom_raster(data = sac_N_available_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = sac_us, fill = "grey30", color = "black") +
+  theme_void() + 
+  labs(title = "Available N in Saccharina's range (kg/yr)") +
+  scale_fill_viridis(option = "magma", name = "kgN/yr", na.value = "black", breaks = seq(0, 100, by = 10))
+
+
+# This doesn't really tell us anything
+ggplot() +
+  geom_raster(data = sac_N_pct_crop_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = sac_us, fill = "grey30", color = "black") +
+  theme_void() + 
+  labs(title = "Percentage of acailable N Saccharina can remove (kg/yr)") +
+  scale_fill_viridis(option = "magma", name = "kgN/yr", na.value = "black")
+
+# In the Northeast, how much can Saccharina actually remove?
+ggplot() +
+  geom_histogram(data = sac_N_pct_crop_df, aes(x = log(layer)), fill = "goldenrod") + 
+  geom_vline(xintercept = log(min(sac_min_removal)), color = "black") +
+  geom_vline(xintercept = log(0.5*min(sac_min_removal)), color = "black") +
+  geom_vline(xintercept = log(0.2*min(sac_min_removal)), color = "black") +
+  theme_bw()
+
+```
+
+```{r}
+# Macrocystis pollution:
+
+macro_bbox <- st_bbox(c(xmin = -130, xmax = -115, ymin = 30, ymax = 50))
+
+macro_N_available <- raster::crop(raster(av_N_nfmp), macro_bbox)
+macro_N_available_df <- as.data.frame(macro_N_available, xy = TRUE) %>% drop_na()
+macro_us <- st_crop(us_shp, macro_bbox)
+
+# Available N in macrocystis' range
+ggplot() +
+  geom_raster(data = macro_N_available_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = macro_us, fill = "grey30", color = "black") +
+  theme_void() + 
+  labs(title = "Available N in Macrocystis's range (kg/yr)") +
+  scale_fill_viridis(option = "magma", name = "kgN/yr", na.value = "black", trans = "log")
+
+
+# Percent uptake by macrocystis
+# First, calculate the cell size: 
+# These are 0.2x0.2 degree cells. Output is in km2.
+
+cell_size_macro <- area(macro_N_available)
+
+# What's macrocystis's uptake in km2?
+# Macrocystis
+# Yeild is 100 tonnes/ha/yr from Buschmann, 2014 The Status of Kelp Exploitation and Marine Agronomy
+# https://www.researchgate.net/publication/329602577_Revisiting_the_economic_profitability_of_giant_kelp_Macrocystis_pyrifera_Ochrophyta_cultivation_in_Chile
+
+# 100 tons/ha * 100 ha/km2 = tons/km2
+macro_yield_tonskm2 <- 100 * 100 
+# tons/km * 907.185 kg/ 1 ton = kg /km
+macro_yield_kgkm2 <-  macro_yield_tonskm2 * 907185
+
+# Macrocystis N content is 0.03 % 
+macro_uptake_kgNkm2 <- macro_yield_kgkm2*0.03
+
+plot(Mn_kg)
+plot(macro_uptake_kgNkm2)
+
+    # 272,155,500 kg/km2
+
+# Multiply this by the cell size: 
+
+macro_uptake_percell <- macro_uptake_kgNkm2 * cell_size_macro
+
+# plot(macro_uptake_percell)
+
+# Minimum uptake - this is absurd. there's no way.  88,255,688,825
+min_uptake_macro <- 88091105812
+
+# Mn_uptake is the potential uptake per cell of macrocystis (kg/yr) - max N in a cell is around 4,000,000 kg / cell
+pct_removedN_macro <- macro_uptake_percell/av_N_nfmp * 100
+
+macro_left_over <- macro_N_available-macro_uptake_percell
+
+mac_N_pct_crop <- raster::crop(pct_removedN_macro, macro_bbox)
+mac_N_pct_crop_df <- as.data.frame(mac_N_pct_crop, xy = TRUE) %>% drop_na()
+
+ggplot() +
+  geom_raster(data = mac_N_pct_crop_df, aes(x = x, y = y, fill = layer)) +
+  geom_sf(data = macro_us, fill = "grey30", color = "black") +
+  theme_void() + 
+  labs(title = "Percent uptake by macrocystis") +
+  scale_fill_viridis(option = "magma", name = "kgN/yr", na.value = "black", limits = c(0, 100))
+
+tmap_mode("view")
+
+tm_shape(mac_N_pct_crop) +
+  tm_raster(style = "fixed", n = 10, title = "% N uptake from sac",
+  palette = colorRampPalette(c("darkred","yellow", "lightgreen"))(10),
+  breaks = c(0, 10, 20, 30, 40, 50, 60, 70, 80, 90, 100, Inf),
+  legend.hist = FALSE) +
+  tm_shape(us_shp) +
+  tm_polygons(col = "white") +
+  tm_layout(legend.position = c("right", "top"))
+
+# In the Pacific, how much can macrocystis actually remove?
+ggplot() +
+  geom_histogram(data = mac_N_pct_crop_df, aes(x = layer), bins = 100, fill = "darkgreen") + 
+  geom_vline(xintercept = min_uptake_macro, color = "black") +
+  geom_vline(xintercept = 0.5*min_uptake_macro, color = "black") +
+  geom_vline(xintercept = 0.2*min_uptake_macro, color = "black") +
+  theme_bw()
+```
+
+
+

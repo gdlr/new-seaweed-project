@@ -1,0 +1,62 @@
+---
+title: "Combining_pollution"
+author: "Gabriel De La Rosa"
+date: "7/9/2021"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(terra)
+library(raster)
+library(here)
+```
+
+This markdown takes the pollution outputs and combines them.
+
+## Phosphorous:
+
+Deposition is mostly naturally occurring, so is excluded from phosphorous (https://pubs.rsc.org/en/content/articlelanding/2014/em/c3em00641g#!divAbstract)
+
+units are... kgP/year
+
+
+```{r}
+# Sum layers
+outfall_p <- raster(here("plume_outputs", "outfalls", "outfall_p.tif"))
+full_outfallP <- raster(here("plume_outputs", "outfalls", "full_P.tif"))
+river_p <- raster(here("plume_outputs", "us_tp_river.tif"))
+
+totalP <- outfall_p + river_p
+
+plot(total)
+
+# Calculate total layer:
+totalP <- as.raster(totalP)
+sumP <- raster::cellStats(totalP, "sum")
+
+sumP
+```
+# Add in exclusion:
+
+```{r}
+exclusion <- raster(here("new_data", "exclusion", "us_exclusion.tif"))
+
+plot(exclusion)
+
+availableP <- totalP * exclusion
+
+plot(availableP)
+
+sum_avP <- raster::cellStats(availableP, "sum")
+
+sum_avP/sumP
+```
+
+total phosphorous pollution is  `r round(sumP, 2)`, but the total phosphorous available in aquaculture marine space is `r round(sum_avP, 2)` which corresponds to `r round(sum_avP/sumP *100, 2)`%.
+
+
+
+
